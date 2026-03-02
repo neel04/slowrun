@@ -46,7 +46,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 
 | # | Val Loss | Description | Date | Time | Script | Contributors |
 | - | - | - | - | - | - | - |
-1 | 3.428 | Baseline: 300M transformer, weight decay 0.8, dropout 0.1 | 03/02/26 | 13.7 mins | - | [@akshayvegesna](https://x.com/akshayvegesna)
+1 | 3.428 | Baseline: 300M transformer, weight decay 0.8, dropout 0.1 | 03/02/26 | 13.7 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/22c1618d843a692384b0329f309ddfb4b5df9ff6/tiny/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 
 
 ### Unlimited Compute Track 
