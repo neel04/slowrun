@@ -49,6 +49,8 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 | - | - | - | - | - | - | - |
 1 | 3.428 | Baseline: 300M transformer, weight decay 0.8, dropout 0.1 | 03/02/26 | 13.7 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/22c1618d843a692384b0329f309ddfb4b5df9ff6/tiny/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 2 | 3.410 | Add swiglu activation | 03/02/26 | 14.4 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/efa7f2ed81ac0b2aa9d5954c9b56ee56786c1934/tiny/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
+3 | 3.395 | Add U-Net architecture | 03/03/26 | 14.5 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0e6280bb7f3673cf84e46a9b7cf7818b24511ed6/tiny/train.py) | [@em-see-squared](https://github.com/em-see-squared), [@akshayvegesna](https://x.com/akshayvegesna)
+
 
 
 
