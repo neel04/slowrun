@@ -1,0 +1,15 @@
+[project]
+name = "slowrun"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.38.2",
+    "pylsp-rope>=0.1.17",
+    "python-lsp-server>=1.14.0",
+    "ruff>=0.15.5",
+]
