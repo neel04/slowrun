@@ -152,6 +152,14 @@ class GPTConfig:
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
+class RMSNorm(nn.Module):
+    """Learnable RMSNorm so each iteration gets unique norm weights."""
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim))
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),)) * self.scale
+
 def has_ve(layer_idx, n_layer):
     """Value Embedding on alternating layers, last layer always included."""
     return layer_idx % 2 == (n_layer - 1) % 2
@@ -245,6 +253,10 @@ class GPT(nn.Module):
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
+        # ASURA: 3 iterations through shared blocks
+        self.num_iterations = 3
+        self.skip_projs = nn.ModuleList([nn.Linear(2 * config.n_embd, config.n_embd, bias=False) for _ in range(self.num_iterations)])
+        self.iter_norms = nn.ModuleList([RMSNorm(config.n_embd) for _ in range(self.num_iterations)])
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -272,6 +284,8 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
         self.skip_weights.fill_(1.0)
+        for proj in self.skip_projs:
+            torch.nn.init.uniform_(proj.weight, -s, s)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
@@ -307,13 +321,14 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters()) + list(self.skip_projs.parameters())
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
+        iter_norm_params = list(self.iter_norms.parameters())
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
@@ -322,6 +337,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=iter_norm_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -338,17 +354,21 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
-        skip_connections = []
-        for i, block in enumerate(self.transformer.h):
-            if i >= self.encoder_layers and skip_connections:
-                skip = skip_connections.pop()
-                x = x + self.skip_weights[i - self.encoder_layers] * skip
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-            if i < self.encoder_layers:
-                skip_connections.append(x)
-        x = norm(x)
+        for iteration in range(self.num_iterations):
+            # ProjConcat: blend current hidden state with original embedding
+            x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
+            skip_connections = []
+            for i, block in enumerate(self.transformer.h):
+                if i >= self.encoder_layers and skip_connections:
+                    skip = skip_connections.pop()
+                    x = x + self.skip_weights[i - self.encoder_layers] * skip
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
+                x = block(x, ve, cos_sin, self.window_sizes[i])
+                if i < self.encoder_layers:
+                    skip_connections.append(x)
+            # Per-iteration learnable norm
+            x = self.iter_norms[iteration](x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
         if targets is not None:
