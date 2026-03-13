@@ -7,6 +7,7 @@ Usage:
 """
 
 import os
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import math
@@ -14,7 +15,6 @@ import time
 import json
 import argparse
 from types import SimpleNamespace
-from functools import partial
 from dataclasses import dataclass
 from contextlib import nullcontext
 
@@ -22,7 +22,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch import Tensor
 import wandb
 import tiktoken
 
@@ -95,23 +94,38 @@ FINAL_LR_FRAC = 0.0
 # Utilities
 # =============================================================================
 
+
 def get_dist_info():
     if all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
-        return True, int(os.environ['RANK']), int(os.environ['LOCAL_RANK']), int(os.environ['WORLD_SIZE'])
+        return (
+            True,
+            int(os.environ["RANK"]),
+            int(os.environ["LOCAL_RANK"]),
+            int(os.environ["WORLD_SIZE"]),
+        )
     return False, 0, 0, 1
 
+
 def print0(s="", **kwargs):
-    if int(os.environ.get('RANK', 0)) == 0:
+    if int(os.environ.get("RANK", 0)) == 0:
         print(s, **kwargs)
 
+
 class DummyWandb:
-    def __init__(self): self.summary = {}
-    def log(self, *a, **kw): pass
-    def finish(self): pass
+    def __init__(self):
+        self.summary = {}
+
+    def log(self, *a, **kw):
+        pass
+
+    def finish(self):
+        pass
+
 
 # =============================================================================
 # Flash Attention (FA3 on Hopper)
 # =============================================================================
+
 
 def _load_fa3():
     if not torch.cuda.is_available():
@@ -122,21 +136,26 @@ def _load_fa3():
             return None
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel
-        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
+
+        return get_kernel("varunneal/flash-attention-3").flash_attn_interface
     except Exception:
         return None
 
+
 _fa3 = _load_fa3()
+
 
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     """Flash Attention for training (FA3 only). q,k,v: (B, T, H, D)."""
     return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 
 # =============================================================================
 # GPT Model
 # =============================================================================
+
 
 @dataclass
 class GPTConfig:
@@ -149,20 +168,26 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
 
+
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
+
 class RMSNorm(nn.Module):
     """Learnable RMSNorm so each iteration gets unique norm weights."""
+
     def __init__(self, dim):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(dim))
+
     def forward(self, x):
         return F.rms_norm(x, (x.size(-1),)) * self.scale
+
 
 def has_ve(layer_idx, n_layer):
     """Value Embedding on alternating layers, last layer always included."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
 
 def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
@@ -177,14 +202,22 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+
         assert self.n_embd % self.n_head == 0
+
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
+
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = (
+            nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
+            if has_ve(layer_idx, config.n_layer)
+            else None
+        )
+
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
@@ -197,16 +230,24 @@ class CausalSelfAttention(nn.Module):
         # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        # XSA: remove self-value projection from attention output (arXiv 2603.09078)
+        vn = F.normalize(v, dim=-1)
+        if self.n_kv_head != self.n_head:
+            vn = vn.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+        y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
         # Attention gate: per-head sigmoid gate
-        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
+        y = y * torch.sigmoid(
+            self.attn_gate(x[..., : self.attn_gate_channels])
+        ).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
         return self.resid_dropout(self.c_proj(y))
+
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -219,6 +260,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
+
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
@@ -237,7 +279,9 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
-        padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
+        padded_vocab = (
+            (config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to
+        ) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
         self.transformer = nn.ModuleDict({
@@ -249,14 +293,23 @@ class GPT(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.ve_projs = nn.ModuleDict({str(i): nn.Linear(config.n_embd, kv_dim, bias=False) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.ve_projs = nn.ModuleDict({
+            str(i): nn.Linear(config.n_embd, kv_dim, bias=False)
+            for i in range(config.n_layer)
+            if has_ve(i, config.n_layer)
+        })
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         # ASURA: 3 iterations through shared blocks
         self.num_iterations = 3
-        self.skip_projs = nn.ModuleList([nn.Linear(2 * config.n_embd, config.n_embd, bias=False) for _ in range(self.num_iterations)])
-        self.iter_norms = nn.ModuleList([RMSNorm(config.n_embd) for _ in range(self.num_iterations)])
+        self.skip_projs = nn.ModuleList([
+            nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
+            for _ in range(self.num_iterations)
+        ])
+        self.iter_norms = nn.ModuleList([
+            RMSNorm(config.n_embd) for _ in range(self.num_iterations)
+        ])
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -294,7 +347,13 @@ class GPT(nn.Module):
 
     def _precompute_rotary(self, seq_len, head_dim, base=10000):
         device = self.transformer.wte.weight.device
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+                / head_dim
+            )
+        )
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
@@ -313,15 +372,35 @@ class GPT(nn.Module):
 
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
-        ve_numel = sum(p.weight.numel() for p in self.ve_projs.values())
-        nparams_exclude = self.transformer.wte.weight.numel() + ve_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        attn_flops = sum(12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t for w in self.window_sizes)
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        shared_params = sum(p.numel() for p in self.transformer.h.parameters()) + sum(
+            p.numel() for p in self.ve_projs.parameters()
+        )
+        nparams_exclude = (
+            self.transformer.wte.weight.numel()
+            + self.resid_lambdas.numel()
+            + self.x0_lambdas.numel()
+        )
+        effective_params = (
+            nparams - nparams_exclude + (self.num_iterations - 1) * shared_params
+        )
+        h, q, t = (
+            self.config.n_head,
+            self.config.n_embd // self.config.n_head,
+            self.config.sequence_len,
+        )
+        attn_flops = self.num_iterations * sum(
+            12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t
+            for w in self.window_sizes
+        )
+        return 6 * effective_params + attn_flops
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters()) + list(self.skip_projs.parameters())
+        matrix_params = (
+            list(self.transformer.h.parameters())
+            + list(self.ve_projs.parameters())
+            + list(self.skip_projs.parameters())
+        )
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -331,49 +410,119 @@ class GPT(nn.Module):
         iter_norm_params = list(self.iter_norms.parameters())
 
         param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=ve_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=iter_norm_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+            dict(
+                kind="adamw",
+                params=lm_head_params,
+                lr=UNEMBEDDING_LR,
+                betas=ADAM_BETAS,
+                eps=1e-10,
+                weight_decay=WEIGHT_DECAY,
+            ),
+            dict(
+                kind="adamw",
+                params=embed_params,
+                lr=EMBEDDING_LR,
+                betas=ADAM_BETAS,
+                eps=1e-10,
+                weight_decay=WEIGHT_DECAY,
+            ),
+            dict(
+                kind="adamw",
+                params=ve_params,
+                lr=EMBEDDING_LR,
+                betas=ADAM_BETAS,
+                eps=1e-10,
+                weight_decay=WEIGHT_DECAY,
+            ),
+            dict(
+                kind="adamw",
+                params=resid_params,
+                lr=SCALAR_LR * 0.01,
+                betas=ADAM_BETAS,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=x0_params,
+                lr=SCALAR_LR,
+                betas=(0.96, 0.95),
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=skip_params,
+                lr=SCALAR_LR * 0.01,
+                betas=ADAM_BETAS,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=iter_norm_params,
+                lr=SCALAR_LR,
+                betas=ADAM_BETAS,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
-                                     momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY))
+            param_groups.append(
+                dict(
+                    kind="muon",
+                    params=group_params,
+                    lr=MATRIX_LR,
+                    momentum=0.95,
+                    ns_steps=5,
+                    beta2=0.95,
+                    weight_decay=WEIGHT_DECAY,
+                )
+            )
 
         optimizer = DistMuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction="mean"):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
+
         for iteration in range(self.num_iterations):
-            # ProjConcat: blend current hidden state with original embedding
             x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
             skip_connections = []
+
             for i, block in enumerate(self.transformer.h):
                 if i >= self.encoder_layers and skip_connections:
                     skip = skip_connections.pop()
                     x = x + self.skip_weights[i - self.encoder_layers] * skip
-                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+
+                # INFO: (Remove)  x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                 ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
                 x = block(x, ve, cos_sin, self.window_sizes[i])
+
                 if i < self.encoder_layers:
                     skip_connections.append(x)
+
             # Per-iteration learnable norm
             x = self.iter_norms[iteration](x)
-        logits = self.lm_head(x)[..., :self.config.vocab_size].float()
+
+        logits = self.lm_head(x)[..., : self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
+
         if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction=loss_reduction,
+            )
         return logits
+
 
 # =============================================================================
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
@@ -388,18 +537,32 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+
 @torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
+def adamw_step_fused(
+    p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t
+):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
+    bias1 = 1 - beta1_t**step_t
+    bias2 = 1 - beta2_t**step_t
     p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
 
+
 @torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+def muon_step_fused(
+    stacked_grads,
+    stacked_params,
+    momentum_buffer,
+    second_momentum_buffer,
+    momentum_t,
+    lr_t,
+    wd_t,
+    beta2_t,
+    ns_steps,
+    red_dim,
+):
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
@@ -421,7 +584,9 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    second_momentum_buffer.lerp_(
+        v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2
+    )
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -433,8 +598,10 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
+
 class DistMuonAdamW(torch.optim.Optimizer):
     """Distributed MuonAdamW with ZeRO-2 style sharding."""
+
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
         self._adamw_step_t = torch.tensor(0.0)
@@ -450,74 +617,102 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     def _reduce_adamw(self, group, world_size):
         infos = {}
-        for p in group['params']:
+        for p in group["params"]:
             grad = p.grad
             if p.numel() < 1024:
-                future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                future = dist.all_reduce(
+                    grad, op=dist.ReduceOp.AVG, async_op=True
+                ).get_future()
                 infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
                 assert grad.shape[0] % world_size == 0
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
-                future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                future = dist.reduce_scatter_tensor(
+                    grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True
+                ).get_future()
                 infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
         return dict(param_infos=infos)
 
     def _reduce_muon(self, group, world_size):
-        params = group['params']
+        params = group["params"]
         chunk_size = (len(params) + world_size - 1) // world_size
         padded = chunk_size * world_size
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
         stacked_grads = torch.empty(padded, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(torch.stack([p.grad for p in params]))
+        stacked_grads[: len(params)].copy_(torch.stack([p.grad for p in params]))
         if len(params) < padded:
-            stacked_grads[len(params):].zero_()
+            stacked_grads[len(params) :].zero_()
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
-        future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+        future = dist.reduce_scatter_tensor(
+            grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
+        ).get_future()
+        return dict(
+            future=future,
+            grad_chunk=grad_chunk,
+            stacked_grads=stacked_grads,
+            chunk_size=chunk_size,
+        )
 
     def _compute_adamw(self, group, info, gather_list, rank, world_size):
-        for p in group['params']:
-            pinfo = info['param_infos'][p]
-            pinfo['future'].wait()
+        for p in group["params"]:
+            pinfo = info["param_infos"][p]
+            pinfo["future"].wait()
             state = self.state[p]
-            if pinfo['is_small']:
+            if pinfo["is_small"]:
                 p_slice = p
             else:
                 rank_size = p.shape[0] // world_size
-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+                p_slice = p[rank * rank_size : (rank + 1) * rank_size]
             if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p_slice)
-                state['exp_avg_sq'] = torch.zeros_like(p_slice)
-            state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
-                           self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                           self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
-            if not pinfo['is_small']:
-                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(p_slice)
+                state["exp_avg_sq"] = torch.zeros_like(p_slice)
+            state["step"] += 1
+            self._adamw_step_t.fill_(state["step"])
+            self._adamw_lr_t.fill_(group["lr"])
+            self._adamw_beta1_t.fill_(group["betas"][0])
+            self._adamw_beta2_t.fill_(group["betas"][1])
+            self._adamw_eps_t.fill_(group["eps"])
+            self._adamw_wd_t.fill_(group["weight_decay"])
+            adamw_step_fused(
+                p_slice,
+                pinfo["grad_slice"],
+                state["exp_avg"],
+                state["exp_avg_sq"],
+                self._adamw_step_t,
+                self._adamw_lr_t,
+                self._adamw_beta1_t,
+                self._adamw_beta2_t,
+                self._adamw_eps_t,
+                self._adamw_wd_t,
+            )
+            if not pinfo["is_small"]:
+                future = dist.all_gather_into_tensor(
+                    p, p_slice, async_op=True
+                ).get_future()
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group, info, gather_list, rank):
-        info['future'].wait()
-        params = group['params']
-        chunk_size = info['chunk_size']
+        info["future"].wait()
+        params = group["params"]
+        chunk_size = info["chunk_size"]
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
         state = self.state[p]
         if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+            state["momentum_buffer"] = torch.zeros(
+                chunk_size, *shape, dtype=dtype, device=device
+            )
         if "second_momentum_buffer" not in state:
-            s = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+            s = (
+                (chunk_size, shape[-2], 1)
+                if shape[-2] >= shape[-1]
+                else (chunk_size, 1, shape[-1])
+            )
             state["second_momentum_buffer"] = torch.zeros(s, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
         updated = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
@@ -525,48 +720,72 @@ class DistMuonAdamW(torch.optim.Optimizer):
             owned = torch.stack([params[start_idx + i] for i in range(num_owned)])
             self._muon_momentum_t.fill_(group["momentum"])
             self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(info['grad_chunk'][:num_owned], owned,
-                          state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                          self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                          group["ns_steps"], red_dim)
+            muon_step_fused(
+                info["grad_chunk"][:num_owned],
+                owned,
+                state["momentum_buffer"][:num_owned],
+                state["second_momentum_buffer"][:num_owned],
+                self._muon_momentum_t,
+                self._muon_lr_t,
+                self._muon_wd_t,
+                self._muon_beta2_t,
+                group["ns_steps"],
+                red_dim,
+            )
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
             updated[num_owned:].zero_()
         stacked_params = info["stacked_grads"]
-        future = dist.all_gather_into_tensor(stacked_params, updated, async_op=True).get_future()
-        gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
+        future = dist.all_gather_into_tensor(
+            stacked_params, updated, async_op=True
+        ).get_future()
+        gather_list.append(
+            dict(future=future, stacked_params=stacked_params, params=params)
+        )
 
     @torch.no_grad()
     def step(self):
         rank, world_size = dist.get_rank(), dist.get_world_size()
         reduce_infos = []
         for group in self.param_groups:
-            if group['kind'] == 'adamw': reduce_infos.append(self._reduce_adamw(group, world_size))
-            elif group['kind'] == 'muon': reduce_infos.append(self._reduce_muon(group, world_size))
+            if group["kind"] == "adamw":
+                reduce_infos.append(self._reduce_adamw(group, world_size))
+            elif group["kind"] == "muon":
+                reduce_infos.append(self._reduce_muon(group, world_size))
         gather_list = []
         for group, info in zip(self.param_groups, reduce_infos):
-            if group['kind'] == 'adamw': self._compute_adamw(group, info, gather_list, rank, world_size)
-            elif group['kind'] == 'muon': self._compute_muon(group, info, gather_list, rank)
+            if group["kind"] == "adamw":
+                self._compute_adamw(group, info, gather_list, rank, world_size)
+            elif group["kind"] == "muon":
+                self._compute_muon(group, info, gather_list, rank)
         for info in gather_list:
             info["future"].wait()
             if info.get("params") is not None:
-                torch._foreach_copy_(info["params"], list(info["stacked_params"][:len(info["params"])].unbind(0)))
+                torch._foreach_copy_(
+                    info["params"],
+                    list(info["stacked_params"][: len(info["params"])].unbind(0)),
+                )
+
+
 # =============================================================================
 # Dataloader: BOS-aligned best-fit packing
 # =============================================================================
+
 
 class DataLoader:
     """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever."""
 
     def __init__(self, filepath, B, T, device="cuda"):
         data = torch.load(filepath, weights_only=True)
-        chunks = data['chunks']
-        valid_counts = data['valid_counts']
-        file_B = data['batch_size']
-        sequence_size = data['sequence_size']
-        assert sequence_size == T + 1, f"Data sequence_size {sequence_size} != T+1={T+1}"
+        chunks = data["chunks"]
+        valid_counts = data["valid_counts"]
+        file_B = data["batch_size"]
+        sequence_size = data["sequence_size"]
+        assert sequence_size == T + 1, (
+            f"Data sequence_size {sequence_size} != T+1={T + 1}"
+        )
 
         # Gather all valid sequences into one tensor
         all_seqs = []
@@ -608,10 +827,12 @@ class DataLoader:
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
-        
+
+
 # =============================================================================
 # Loss evaluation
 # =============================================================================
+
 
 @torch.no_grad()
 def evaluate_bpb(model, batches, steps, token_bytes):
@@ -623,7 +844,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, _ = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none').view(-1)
+        loss2d = model(x, y, loss_reduction="none").view(-1)
         y = y.view(-1)
         mask = y != -1
         total_loss += loss2d[mask].sum()
@@ -638,9 +859,10 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
     total_nats, total_bytes = total_nats.item(), total_bytes.item()
     total_loss, total_tokens = total_loss.item(), total_tokens.item()
-    bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
-    loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
+    bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float("inf")
+    loss = total_loss / total_tokens if total_tokens > 0 else float("inf")
     return bpb, loss
+
 
 # =============================================================================
 # Training
@@ -661,23 +883,32 @@ else:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 device_type = device.type
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+autocast_ctx = (
+    torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+    if device_type == "cuda"
+    else nullcontext()
+)
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
 # GPU info for MFU
-gpu_peak_flops = float('inf')
+gpu_peak_flops = float("inf")
 if device_type == "cuda":
     gpu_name = torch.cuda.get_device_name(0).lower()
-    if "h100" in gpu_name: gpu_peak_flops = 989e12
-    elif "a100" in gpu_name: gpu_peak_flops = 312e12
-    elif "4090" in gpu_name: gpu_peak_flops = 165.2e12
+    if "h100" in gpu_name:
+        gpu_peak_flops = 989e12
+    elif "a100" in gpu_name:
+        gpu_peak_flops = 312e12
+    elif "4090" in gpu_name:
+        gpu_peak_flops = 165.2e12
 
 # FA3 status
 if _fa3 is not None:
     print0("Using Flash Attention 3 (Hopper GPU detected)")
 else:
-    raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
+    raise RuntimeError(
+        "Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed."
+    )
 
 # wandb
 run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
@@ -689,23 +920,29 @@ if master_process:
     wandb_run.log_code(".")
 
 # Print hyperparameters
-print0(f"--- Hyperparameters ---")
+print0("--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
-print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
-print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
+print0(
+    f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}"
+)
+print0(
+    f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}"
+)
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
-print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
+print0(
+    f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}"
+)
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
-print0(f"-----------------------")
+print0("-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
 encoder = tiktoken.get_encoding("gpt2")
 vocab_size = encoder.n_vocab  # 50257
 print0(f"Vocab size: {vocab_size:,}")
 
-eot_id = encoder._special_tokens['<|endoftext|>']
+eot_id = encoder._special_tokens["<|endoftext|>"]
 token_bytes_list = []
 for i in range(vocab_size):
     if i == eot_id:
@@ -727,7 +964,9 @@ ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
 other_params = param_counts - transformer_params - ve_params - lm_head_params
 num_flops_per_token = model.estimate_flops()
-print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
+print0(
+    f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})"
+)
 print0(f"FLOPs per token: {num_flops_per_token:e}")
 
 # Compile
@@ -738,10 +977,20 @@ model = torch.compile(model, dynamic=False)
 optimizer = model.setup_optimizer()
 
 # Dataloaders
-_train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
-_val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
-build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
+_train_path = (
+    args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
+)
+_val_path = (
+    args.input_val_bin
+    if args.input_val_bin
+    else os.path.join(DATA_DIR, "fineweb_val.pt")
+)
+train_loader = DataLoader(
+    _train_path, args.device_batch_size, MAX_SEQ_LEN, device=device
+)
+build_val_loader = lambda: DataLoader(
+    _val_path, args.device_batch_size, MAX_SEQ_LEN, device=device
+)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
 
@@ -749,23 +998,30 @@ x, y, current_epoch = next(train_loader)
 tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
+num_iterations = round(
+    TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE
+)  # estimate for LR schedule
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
+
 
 # Schedulers
 def get_lr_multiplier(it):
     warmup = round(WARMUP_RATIO * num_iterations)
     warmdown = round(WARMDOWN_RATIO * num_iterations)
-    if it < warmup: return (it + 1) / warmup
-    elif it <= num_iterations - warmdown: return 1.0
+    if it < warmup:
+        return (it + 1) / warmup
+    elif it <= num_iterations - warmdown:
+        return 1.0
     else:
         progress = (num_iterations - it) / warmdown
         return progress + (1 - progress) * FINAL_LR_FRAC
 
+
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
+
 
 # Training loop
 step = 0
@@ -802,7 +1058,7 @@ while current_epoch <= args.num_epochs:
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        if group["kind"] == "muon":
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
@@ -818,12 +1074,24 @@ while current_epoch <= args.num_epochs:
     debiased = smooth_train_loss / (1 - ema_beta**step)
     pct = 100 * step / num_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
+    mfu = (
+        100
+        * num_flops_per_token
+        * TOTAL_BATCH_SIZE
+        / dt
+        / (gpu_peak_flops * ddp_world_size)
+    )
     if step > 10:
         total_training_time += dt
     steps_done = step - 10
-    eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+    eta_str = (
+        f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m"
+        if steps_done > 0
+        else ""
+    )
+    print0(
+        f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}"
+    )
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
@@ -838,8 +1106,15 @@ while current_epoch <= args.num_epochs:
         val_loader = build_val_loader()
         with autocast_ctx:
             val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+        print0(
+            f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}"
+        )
+        wandb_run.log({
+            "step": step,
+            "epoch": current_epoch,
+            "val/bpb": val_bpb,
+            "val/loss": val_loss,
+        })
         # Early stopping
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -859,12 +1134,14 @@ while current_epoch <= args.num_epochs:
 
     # GC management
     if step == 1:
-        gc.collect(); gc.freeze(); gc.disable()
+        gc.collect()
+        gc.freeze()
+        gc.disable()
 
 # Summary
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
-print0(f"Total training time: {total_training_time/60:.2f}m")
-final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float('inf')
+print0(f"Total training time: {total_training_time / 60:.2f}m")
+final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float("inf")
 print0(f"Final train loss: {final_train_loss:.6f}")
 print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
@@ -885,9 +1162,8 @@ if args.save_result and master_process:
     print0(f"Result saved to {args.save_result}")
 
 total_wall_time = time.time() - _script_start
-print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
+print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time / 60:.2f}m)")
 
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-
