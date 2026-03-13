@@ -123,7 +123,7 @@ class DummyWandb:
 
 
 # =============================================================================
-# Flash Attention (FA3 on Hopper)
+# Attention backend
 # =============================================================================
 
 
@@ -142,12 +142,68 @@ def _load_fa3():
         return None
 
 
+def _load_fa2():
+    if not torch.cuda.is_available():
+        return None
+    try:
+        from flash_attn import flash_attn_func as fa2_func
+
+        return fa2_func
+    except Exception:
+        try:
+            from flash_attn.flash_attn_interface import flash_attn_func as fa2_func
+
+            return fa2_func
+        except Exception:
+            return None
+
+
 _fa3 = _load_fa3()
+_fa2 = _load_fa2()
+if _fa3 is not None:
+    ATTN_BACKEND = "fa3"
+elif _fa2 is not None:
+    ATTN_BACKEND = "fa2"
+else:
+    ATTN_BACKEND = "sdpa"
+
+
+def _sdpa_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    if k.size(1) != q.size(1):
+        repeat = q.size(1) // k.size(1)
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+    left_window, right_window = window_size
+    attn_mask = None
+    if causal or left_window >= 0 or right_window >= 0:
+        q_idx = torch.arange(q.size(-2), device=q.device)
+        k_idx = torch.arange(k.size(-2), device=k.device)
+        attn_mask = torch.ones(
+            q.size(-2), k.size(-2), device=q.device, dtype=torch.bool
+        )
+        if causal:
+            attn_mask &= k_idx.unsqueeze(0) <= q_idx.unsqueeze(1)
+        if left_window >= 0:
+            attn_mask &= k_idx.unsqueeze(0) >= (q_idx.unsqueeze(1) - left_window)
+        if right_window >= 0:
+            attn_mask &= k_idx.unsqueeze(0) <= (q_idx.unsqueeze(1) + right_window)
+        attn_mask = attn_mask.view(1, 1, q.size(-2), k.size(-2))
+    y = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+    )
+    return y.transpose(1, 2)
 
 
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
-    """Flash Attention for training (FA3 only). q,k,v: (B, T, H, D)."""
-    return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    """Attention backend for training. q,k,v: (B, T, H, D)."""
+    if _fa3 is not None:
+        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    if _fa2 is not None:
+        return _fa2(q, k, v, dropout_p=0.0, causal=causal, window_size=window_size)
+    return _sdpa_attn_func(q, k, v, causal=causal, window_size=window_size)
 
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
@@ -619,6 +675,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         infos = {}
         for p in group["params"]:
             grad = p.grad
+            if grad is None:
+                continue
             if p.numel() < 1024:
                 future = dist.all_reduce(
                     grad, op=dist.ReduceOp.AVG, async_op=True
@@ -657,6 +715,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     def _compute_adamw(self, group, info, gather_list, rank, world_size):
         for p in group["params"]:
+            if p not in info["param_infos"]:
+                continue
             pinfo = info["param_infos"][p]
             pinfo["future"].wait()
             state = self.state[p]
@@ -902,13 +962,15 @@ if device_type == "cuda":
     elif "4090" in gpu_name:
         gpu_peak_flops = 165.2e12
 
-# FA3 status
-if _fa3 is not None:
-    print0("Using Flash Attention 3 (Hopper GPU detected)")
-else:
-    raise RuntimeError(
-        "Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed."
+# Attention backend status
+if device_type == "cuda":
+    cc_major, cc_minor = torch.cuda.get_device_capability(0)
+    backend_msg = (
+        f"Attention backend: {ATTN_BACKEND} | GPU: {torch.cuda.get_device_name(0)} | cc: sm_{cc_major}{cc_minor}"
     )
+else:
+    backend_msg = f"Attention backend: {ATTN_BACKEND} | GPU: cpu"
+print0(backend_msg)
 
 # wandb
 run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
