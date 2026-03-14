@@ -50,6 +50,8 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--z-loss-coeff", type=float, default=1e-4)
+parser.add_argument("--optimizer", type=str, choices=("muon", "adamw"), default="muon")
 args = parser.parse_args()
 
 # Resolve output path
@@ -223,6 +225,7 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
+    z_loss_coeff: float = 0.0
 
 
 def norm(x):
@@ -450,7 +453,7 @@ class GPT(nn.Module):
         )
         return 6 * effective_params + attn_flops
 
-    def setup_optimizer(self):
+    def setup_optimizer(self, optimizer_name="muon"):
         ddp, rank, local_rank, world_size = get_dist_info()
         matrix_params = (
             list(self.transformer.h.parameters())
@@ -523,26 +526,38 @@ class GPT(nn.Module):
                 weight_decay=0.0,
             ),
         ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        if optimizer_name == "adamw":
             param_groups.append(
                 dict(
-                    kind="muon",
-                    params=group_params,
+                    kind="adamw",
+                    params=matrix_params,
                     lr=MATRIX_LR,
-                    momentum=0.95,
-                    ns_steps=5,
-                    beta2=0.95,
+                    betas=ADAM_BETAS,
+                    eps=1e-10,
                     weight_decay=WEIGHT_DECAY,
                 )
             )
+        else:
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(
+                    dict(
+                        kind="muon",
+                        params=group_params,
+                        lr=MATRIX_LR,
+                        momentum=0.95,
+                        ns_steps=5,
+                        beta2=0.95,
+                        weight_decay=WEIGHT_DECAY,
+                    )
+                )
 
         optimizer = DistMuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction="mean"):
+    def forward(self, idx, targets=None, loss_reduction="mean", include_z_loss=True):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
@@ -571,12 +586,24 @@ class GPT(nn.Module):
         logits = 15 * torch.tanh(logits / 15)  # softcap
 
         if targets is not None:
-            return F.cross_entropy(
+            ce = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
                 ignore_index=-1,
-                reduction=loss_reduction,
+                reduction="none",
             )
+            valid = targets.view(-1) != -1
+            total = ce
+            if include_z_loss and self.config.z_loss_coeff != 0.0:
+                z = logits.logsumexp(dim=-1).square().view(-1)
+                total = total + self.config.z_loss_coeff * z * valid
+            if loss_reduction == "none":
+                return total
+            if loss_reduction == "sum":
+                return total[valid].sum()
+            if loss_reduction == "mean":
+                return total[valid].mean()
+            raise ValueError(f"Unsupported loss_reduction={loss_reduction}")
         return logits
 
 
@@ -904,7 +931,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, _ = next(batch_iter)
-        loss2d = model(x, y, loss_reduction="none").view(-1)
+        loss2d = model(x, y, loss_reduction="none", include_z_loss=False).view(-1)
         y = y.view(-1)
         mask = y != -1
         total_loss += loss2d[mask].sum()
@@ -997,6 +1024,8 @@ print0(
 )
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+print0(f"  z_loss_coeff={args.z_loss_coeff}")
+print0(f"  optimizer={args.optimizer}")
 print0("-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -1014,7 +1043,11 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+config = GPTConfig(
+    vocab_size=vocab_size,
+    dropout=args.dropout,
+    z_loss_coeff=args.z_loss_coeff,
+)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1036,7 +1069,7 @@ orig_model = model
 model = torch.compile(model, dynamic=False)
 
 # Optimizer
-optimizer = model.setup_optimizer()
+optimizer = model.setup_optimizer(args.optimizer)
 
 # Dataloaders
 _train_path = (
