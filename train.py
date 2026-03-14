@@ -52,6 +52,7 @@ parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--z-loss-coeff", type=float, default=1e-4)
 parser.add_argument("--optimizer", type=str, choices=("muon", "adamw"), default="muon")
+parser.add_argument("--agc-clip-factor", type=float, default=0.015)
 args = parser.parse_args()
 
 # Resolve output path
@@ -88,7 +89,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
-WARMUP_RATIO = 0.0
+WARMUP_RATIO = 0.03
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
@@ -112,6 +113,26 @@ def print0(s="", **kwargs):
     if int(os.environ.get("RANK", 0)) == 0:
         print(s, **kwargs)
 
+
+def _unitwise_norm(x, eps=1e-6):
+    if x.ndim <= 1:
+        return x.norm().clamp_min(eps)
+    dim = tuple(range(1, x.ndim))
+    return x.norm(dim=dim, keepdim=True).clamp_min(eps)
+
+
+@torch.no_grad()
+def adaptive_clip_grad_(parameters, clip_factor, eps=1e-3):
+    if clip_factor <= 0:
+        return
+    for p in parameters:
+        if p.grad is None or p.ndim <= 1:
+            continue
+        param_norm = _unitwise_norm(p.detach(), eps)
+        grad_norm = _unitwise_norm(p.grad.detach(), eps)
+        max_norm = param_norm * clip_factor
+        clip_scale = (max_norm / grad_norm).clamp(max=1.0)
+        p.grad.mul_(clip_scale)
 
 class DummyWandb:
     def __init__(self):
@@ -1026,6 +1047,7 @@ print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
 print0(f"  z_loss_coeff={args.z_loss_coeff}")
 print0(f"  optimizer={args.optimizer}")
+print0(f"  agc_clip_factor={args.agc_clip_factor}")
 print0("-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -1155,6 +1177,7 @@ while current_epoch <= args.num_epochs:
         group["lr"] = group["initial_lr"] * lrm
         if group["kind"] == "muon":
             group["momentum"] = get_muon_momentum(step)
+    adaptive_clip_grad_(model.parameters(), args.agc_clip_factor)
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
