@@ -157,10 +157,9 @@ def _load_fa3():
         major, _ = torch.cuda.get_device_capability()
         if major != 9:
             return None
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel
+        import flash_attn_interface
 
-        return get_kernel("varunneal/flash-attention-3").flash_attn_interface
+        return flash_attn_interface.flash_attn_func
     except Exception:
         return None
 
@@ -179,6 +178,13 @@ def _load_fa2():
             return fa2_func
         except Exception:
             return None
+
+
+def _is_full_causal_window(q, window_size):
+    left_window, right_window = window_size
+    full_left = left_window < 0 or left_window >= q.size(1) - 1
+    no_future_window = right_window in (-1, 0)
+    return full_left and no_future_window
 
 
 _fa3 = _load_fa3()
@@ -222,8 +228,9 @@ def _sdpa_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
 
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     """Attention backend for training. q,k,v: (B, T, H, D)."""
-    if _fa3 is not None:
-        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    if _fa3 is not None and causal and _is_full_causal_window(q, window_size):
+        y = _fa3(q, k, v, causal=True)
+        return y[0] if isinstance(y, (tuple, list)) else y
     if _fa2 is not None:
         return _fa2(q, k, v, dropout_p=0.0, causal=causal, window_size=window_size)
     return _sdpa_attn_func(q, k, v, causal=causal, window_size=window_size)
