@@ -41,7 +41,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.08)
 parser.add_argument("--weight-decay", type=float, default=1.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n_layer", type=int, default=30)
+parser.add_argument("--n_layer", type=int, default=15)
 parser.add_argument("--n_head", type=int, default=14)
 parser.add_argument("--n_embd", type=int, default=1792)
 parser.add_argument("--lr_multiplier", type=float, default=0.25)
@@ -89,8 +89,8 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
-WARMUP_RATIO = 0.03
-WARMDOWN_RATIO = 0.5
+WARMUP_RATIO = 0.1
+WARMDOWN_RATIO = 0.05
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
