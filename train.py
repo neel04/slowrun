@@ -388,8 +388,11 @@ class GPT(nn.Module):
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
-        # ASURA: 3 iterations through shared blocks
+        # ASURA: 3 iterations through shared blocks.
         self.num_iterations = 3
+        self.register_buffer(
+            "fixed_weights", self._default_fixed_weights(), persistent=False
+        )
         self.skip_projs = nn.ModuleList([
             nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
             for _ in range(self.num_iterations)
@@ -406,7 +409,9 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+
         s = 3**0.5 * self.config.n_embd**-0.5
+
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
@@ -415,20 +420,29 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
+
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
+
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
+
         self.skip_weights.fill_(1.0)
+
         for proj in self.skip_projs:
             torch.nn.init.uniform_(proj.weight, -s, s)
+        self.fixed_weights.copy_(self._default_fixed_weights().to(self.fixed_weights))
+
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
+
         self.cos, self.sin = cos, sin
+
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
@@ -456,6 +470,49 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    def _default_fixed_weights(self):
+        if self.num_iterations == 3:
+            return torch.tensor([0.2, 0.3, 0.5], dtype=torch.float32)
+        weights = torch.arange(1, self.num_iterations + 1, dtype=torch.float32)
+        return weights / weights.sum()
+
+    def _compute_logits(self, x):
+        logits = self.lm_head(x)[..., : self.config.vocab_size].float()
+        return 15 * torch.tanh(logits / 15)  # softcap
+
+    def _compute_loss(self, logits, targets, loss_reduction, include_z_loss):
+        ce = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+            reduction="none",
+        )
+        valid = targets.view(-1) != -1
+        total = ce
+        if include_z_loss and self.config.z_loss_coeff != 0.0:
+            z = logits.logsumexp(dim=-1).square().view(-1)
+            total = total + self.config.z_loss_coeff * z * valid
+        if loss_reduction == "none":
+            return total
+        if loss_reduction == "sum":
+            return total[valid].sum()
+        if loss_reduction == "mean":
+            return total[valid].mean()
+        raise ValueError(f"Unsupported loss_reduction={loss_reduction}")
+
+    def _combine_iteration_losses(self, per_iter_losses):
+        weights = self.fixed_weights.to(
+            device=per_iter_losses.device, dtype=per_iter_losses.dtype
+        )
+        if not torch.isfinite(weights).all() or weights.abs().sum() == 0:
+            raise RuntimeError(
+                f"Invalid fixed_weights detected: {self.fixed_weights.tolist()}"
+            )
+        if per_iter_losses.ndim == 1:
+            return torch.dot(weights, per_iter_losses)
+        view_shape = (weights.size(0),) + (1,) * (per_iter_losses.ndim - 1)
+        return (per_iter_losses * weights.view(view_shape)).sum(dim=0)
 
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
@@ -585,11 +642,19 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction="mean", include_z_loss=True):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        loss_reduction="mean",
+        include_z_loss=True,
+        return_loss_breakdown=False,
+    ):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
+        latents = [] if targets is not None and self.training else None
 
         for iteration in range(self.num_iterations):
             x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
@@ -610,28 +675,36 @@ class GPT(nn.Module):
             # Per-iteration learnable norm
             x = self.iter_norms[iteration](x)
 
-        logits = self.lm_head(x)[..., : self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)  # softcap
+            if latents is not None:
+                latents.append(x)
+
+        logits = self._compute_logits(x)
 
         if targets is not None:
-            ce = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-                reduction="none",
-            )
-            valid = targets.view(-1) != -1
-            total = ce
-            if include_z_loss and self.config.z_loss_coeff != 0.0:
-                z = logits.logsumexp(dim=-1).square().view(-1)
-                total = total + self.config.z_loss_coeff * z * valid
-            if loss_reduction == "none":
-                return total
-            if loss_reduction == "sum":
-                return total[valid].sum()
-            if loss_reduction == "mean":
-                return total[valid].mean()
-            raise ValueError(f"Unsupported loss_reduction={loss_reduction}")
+            if latents is not None:
+                per_iter_losses = torch.stack([
+                    self._compute_loss(
+                        self._compute_logits(iter_x),
+                        targets,
+                        loss_reduction,
+                        include_z_loss,
+                    )
+                    for iter_x in latents
+                ])
+                weighted_loss = self._combine_iteration_losses(per_iter_losses)
+                if return_loss_breakdown:
+                    final_loss = self._compute_loss(
+                        logits, targets, loss_reduction, include_z_loss=False
+                    )
+                    return weighted_loss, final_loss
+                return weighted_loss
+            loss = self._compute_loss(logits, targets, loss_reduction, include_z_loss)
+            if return_loss_breakdown:
+                final_loss = self._compute_loss(
+                    logits, targets, loss_reduction, include_z_loss=False
+                )
+                return loss, final_loss
+            return loss
         return logits
 
 
@@ -648,8 +721,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t
 ):
@@ -1081,6 +1152,7 @@ with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+print0(f"Iteration loss weights: {model.fixed_weights.tolist()}")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
@@ -1153,6 +1225,7 @@ min_val_bpb = float("inf")
 min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
+smooth_train_weighted_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 
@@ -1171,12 +1244,23 @@ while current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
+    train_loss = torch.zeros((), dtype=torch.float32, device=device)
+    weighted_train_loss = torch.zeros((), dtype=torch.float32, device=device)
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
+            weighted_loss, final_loss = model(x, y, return_loss_breakdown=True)
+        weighted_train_loss += weighted_loss.detach().float()
+        train_loss += final_loss.detach().float()
+        (weighted_loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
+
+    train_loss /= grad_accum_steps
+    weighted_train_loss /= grad_accum_steps
+    if dist.is_initialized():
+        loss_stats = torch.stack([train_loss, weighted_train_loss])
+        dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
+        loss_stats /= ddp_world_size
+        train_loss, weighted_train_loss = loss_stats.unbind()
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
@@ -1188,6 +1272,7 @@ while current_epoch <= args.num_epochs:
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
+    weighted_train_loss_f = weighted_train_loss.item()
     synchronize()
     dt = time.time() - t0
 
@@ -1196,7 +1281,12 @@ while current_epoch <= args.num_epochs:
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    smooth_train_weighted_loss = (
+        ema_beta * smooth_train_weighted_loss
+        + (1 - ema_beta) * weighted_train_loss_f
+    )
     debiased = smooth_train_loss / (1 - ema_beta**step)
+    debiased_weighted = smooth_train_weighted_loss / (1 - ema_beta**step)
     pct = 100 * step / num_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = (
@@ -1215,9 +1305,14 @@ while current_epoch <= args.num_epochs:
         else ""
     )
     print0(
-        f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}"
+        f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | weighted_loss: {debiased_weighted:.6f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}"
     )
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    wandb_run.log({
+        "step": step,
+        "train/loss": debiased,
+        "train/weighted_loss": debiased_weighted,
+        "train/mfu": mfu,
+    })
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1267,10 +1362,15 @@ while current_epoch <= args.num_epochs:
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
 print0(f"Total training time: {total_training_time / 60:.2f}m")
 final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float("inf")
+final_weighted_train_loss = (
+    smooth_train_weighted_loss / (1 - 0.9**step) if step > 0 else float("inf")
+)
 print0(f"Final train loss: {final_train_loss:.6f}")
+print0(f"Final weighted train loss: {final_weighted_train_loss:.6f}")
 print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
+wandb_run.summary["final_weighted_train_loss"] = final_weighted_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
 
 if args.save_result and master_process:
