@@ -53,6 +53,7 @@ parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--z-loss-coeff", type=float, default=1e-4)
 parser.add_argument("--optimizer", type=str, choices=("muon", "adamw"), default="muon")
 parser.add_argument("--agc-clip-factor", type=float, default=0.015)
+parser.add_argument("--hira-rank", type=int, default=8)
 args = parser.parse_args()
 
 # Resolve output path
@@ -70,6 +71,7 @@ N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
+NUM_ITERATIONS = 3
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = 10_000_000
 DATA_DIR = "fineweb_data"
@@ -254,10 +256,17 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
     z_loss_coeff: float = 0.0
+    num_iterations: int = NUM_ITERATIONS
+    hira_rank: int = 8
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
+
+
+def new_gelu(x):
+    c = math.sqrt(2.0 / math.pi)
+    return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * x.pow(3.0))))
 
 
 class RMSNorm(nn.Module):
@@ -280,6 +289,46 @@ def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], 3)
+
+
+def megatron_uniform_(tensor):
+    fan_in, fan_out = tensor.shape
+    std = (0.33 / fan_in) ** 0.5
+    lim = fan_out**-0.5
+    return torch.nn.init.uniform_(tensor, -lim, lim).mul_(std)
+
+
+class ABBA(nn.Module):
+    """HiRA-style ABBA adapter used for per-iteration parameter relaxation."""
+
+    def __init__(self, in_dim, out_dim, rank):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.rank = rank
+        self.scale = 1.0 / rank
+        self.B_1 = nn.Parameter(torch.empty(in_dim, rank))
+        self.A_1 = nn.Parameter(torch.empty(rank, out_dim))
+        self.B_2 = nn.Parameter(torch.empty(in_dim, rank))
+        self.A_2 = nn.Parameter(torch.empty(rank, out_dim))
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        megatron_uniform_(self.B_1)
+        megatron_uniform_(self.A_1)
+        torch.nn.init.zeros_(self.B_2)
+        megatron_uniform_(self.A_2)
+
+    def forward(self, x):
+        a_kr = (
+            (self.A_1.mT.unsqueeze(-1) * self.A_2.mT.unsqueeze(-2))
+            .reshape(self.out_dim, self.rank * self.rank)
+            .transpose(0, 1)
+        )
+        b_kr = (
+            self.B_1.unsqueeze(-1) * self.B_2.unsqueeze(-2)
+        ).reshape(self.in_dim, self.rank * self.rank)
+        return self.scale * ((x @ b_kr) @ a_kr)
 
 
 class CausalSelfAttention(nn.Module):
@@ -354,10 +403,30 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        if config.hira_rank > 0:
+            self.attn_relax = nn.ModuleList([
+                ABBA(config.n_embd, config.n_embd, config.hira_rank)
+                for _ in range(config.num_iterations)
+            ])
+            self.mlp_relax = nn.ModuleList([
+                ABBA(config.n_embd, config.n_embd, config.hira_rank)
+                for _ in range(config.num_iterations)
+            ])
+        else:
+            self.attn_relax = None
+            self.mlp_relax = None
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, ve, cos_sin, window_size, iteration_idx):
+        x_norm = norm(x)
+        attn_out = self.attn(x_norm, ve, cos_sin, window_size)
+        if self.attn_relax is not None:
+            attn_out = attn_out + new_gelu(self.attn_relax[iteration_idx](x_norm))
+        x = x + attn_out
+        x_norm = norm(x)
+        mlp_out = self.mlp(x_norm)
+        if self.mlp_relax is not None:
+            mlp_out = mlp_out + new_gelu(self.mlp_relax[iteration_idx](x_norm))
+        x = x + mlp_out
         return x
 
 
@@ -376,8 +445,6 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.ve_projs = nn.ModuleDict({
@@ -388,8 +455,8 @@ class GPT(nn.Module):
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
-        # ASURA: 3 iterations through shared blocks.
-        self.num_iterations = 3
+        # ASURA: multiple iterations through the shared block stack.
+        self.num_iterations = config.num_iterations
         self.register_buffer(
             "fixed_weights", self._default_fixed_weights(), persistent=False
         )
@@ -421,9 +488,6 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
-        self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
-
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
 
@@ -431,6 +495,11 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
+            if block.attn_relax is not None:
+                for adapter in block.attn_relax:
+                    adapter.reset_parameters()
+                for adapter in block.mlp_relax:
+                    adapter.reset_parameters()
 
         self.skip_weights.fill_(1.0)
 
@@ -516,14 +585,19 @@ class GPT(nn.Module):
 
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
-        shared_params = sum(p.numel() for p in self.transformer.h.parameters()) + sum(
-            p.numel() for p in self.ve_projs.parameters()
+        hira_params = sum(
+            p.numel()
+            for block in self.transformer.h
+            for relax in (block.attn_relax, block.mlp_relax)
+            if relax is not None
+            for p in relax.parameters()
         )
-        nparams_exclude = (
-            self.transformer.wte.weight.numel()
-            + self.resid_lambdas.numel()
-            + self.x0_lambdas.numel()
+        shared_params = (
+            sum(p.numel() for p in self.transformer.h.parameters())
+            - hira_params
+            + sum(p.numel() for p in self.ve_projs.parameters())
         )
+        nparams_exclude = self.transformer.wte.weight.numel()
         effective_params = (
             nparams - nparams_exclude + (self.num_iterations - 1) * shared_params
         )
@@ -548,8 +622,6 @@ class GPT(nn.Module):
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
         iter_norm_params = list(self.iter_norms.parameters())
 
@@ -577,22 +649,6 @@ class GPT(nn.Module):
                 betas=ADAM_BETAS,
                 eps=1e-10,
                 weight_decay=WEIGHT_DECAY,
-            ),
-            dict(
-                kind="adamw",
-                params=resid_params,
-                lr=SCALAR_LR * 0.01,
-                betas=ADAM_BETAS,
-                eps=1e-10,
-                weight_decay=0.0,
-            ),
-            dict(
-                kind="adamw",
-                params=x0_params,
-                lr=SCALAR_LR,
-                betas=(0.96, 0.95),
-                eps=1e-10,
-                weight_decay=0.0,
             ),
             dict(
                 kind="adamw",
@@ -665,9 +721,8 @@ class GPT(nn.Module):
                     skip = skip_connections.pop()
                     x = x + self.skip_weights[i - self.encoder_layers] * skip
 
-                # INFO: (Remove)  x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                 ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-                x = block(x, ve, cos_sin, self.window_sizes[i])
+                x = block(x, ve, cos_sin, self.window_sizes[i], iteration)
 
                 if i < self.encoder_layers:
                     skip_connections.append(x)
@@ -1111,6 +1166,7 @@ if master_process:
 print0("--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
+print0(f"  num_iterations={NUM_ITERATIONS}, hira_rank={args.hira_rank}")
 print0(
     f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}"
 )
@@ -1147,12 +1203,14 @@ config = GPTConfig(
     vocab_size=vocab_size,
     dropout=args.dropout,
     z_loss_coeff=args.z_loss_coeff,
+    hira_rank=args.hira_rank,
 )
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
 print0(f"Iteration loss weights: {model.fixed_weights.tolist()}")
+print0(f"HiRA parameter relaxation: {'enabled' if args.hira_rank > 0 else 'disabled'}")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
