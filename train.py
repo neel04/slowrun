@@ -53,7 +53,7 @@ parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--z-loss-coeff", type=float, default=1e-4)
 parser.add_argument("--optimizer", type=str, choices=("muon", "adamw"), default="muon")
 parser.add_argument("--agc-clip-factor", type=float, default=0.015)
-parser.add_argument("--hira-rank", type=int, default=8)
+parser.add_argument("--hira-rank", type=int, default=32)
 args = parser.parse_args()
 
 # Resolve output path
@@ -316,7 +316,8 @@ class ABBA(nn.Module):
     def reset_parameters(self):
         megatron_uniform_(self.B_1)
         megatron_uniform_(self.A_1)
-        torch.nn.init.zeros_(self.B_2)
+        megatron_uniform_(self.B_2)
+        self.B_2.mul_(1e-3)
         megatron_uniform_(self.A_2)
 
     def forward(self, x):
@@ -539,6 +540,23 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    def get_hira_b2_rms(self):
+        b2_params = [
+            adapter.B_2
+            for block in self.transformer.h
+            if block.attn_relax is not None
+            for relax in (block.attn_relax, block.mlp_relax)
+            for adapter in relax
+        ]
+        if not b2_params:
+            return None
+        sq_sum = torch.zeros((), device=b2_params[0].device, dtype=torch.float32)
+        numel = 0
+        for p in b2_params:
+            sq_sum += p.float().square().sum()
+            numel += p.numel()
+        return (sq_sum / numel).sqrt()
 
     def _default_fixed_weights(self):
         if self.num_iterations == 3:
@@ -1365,12 +1383,16 @@ while current_epoch <= args.num_epochs:
     print0(
         f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | weighted_loss: {debiased_weighted:.6f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}"
     )
-    wandb_run.log({
+    wandb_payload = {
         "step": step,
         "train/loss": debiased,
         "train/weighted_loss": debiased_weighted,
         "train/mfu": mfu,
-    })
+    }
+    hira_b2_rms = orig_model.get_hira_b2_rms()
+    if hira_b2_rms is not None:
+        wandb_payload["hira/b2_rms"] = hira_b2_rms.item()
+    wandb_run.log(wandb_payload)
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
