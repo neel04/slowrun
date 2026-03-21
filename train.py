@@ -420,13 +420,17 @@ class Block(nn.Module):
     def forward(self, x, ve, cos_sin, window_size, iteration_idx):
         x_norm = norm(x)
         attn_out = self.attn(x_norm, ve, cos_sin, window_size)
+
         if self.attn_relax is not None:
-            attn_out = attn_out + new_gelu(self.attn_relax[iteration_idx](x_norm))
+            attn_out += new_gelu(self.attn_relax[iteration_idx](x_norm))
+
         x = x + attn_out
         x_norm = norm(x)
         mlp_out = self.mlp(x_norm)
+
         if self.mlp_relax is not None:
-            mlp_out = mlp_out + new_gelu(self.mlp_relax[iteration_idx](x_norm))
+            mlp_out += new_gelu(self.mlp_relax[iteration_idx](x_norm))
+
         x = x + mlp_out
         return x
 
@@ -541,22 +545,34 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def get_hira_b2_rms(self):
-        b2_params = [
-            adapter.B_2
+    def _rms(self, tensors):
+        if not tensors:
+            return None
+        sq_sum = torch.zeros((), device=tensors[0].device, dtype=torch.float32)
+        numel = 0
+        for p in tensors:
+            sq_sum += p.float().square().sum()
+            numel += p.numel()
+        return (sq_sum / numel).sqrt()
+
+    def get_hira_rms(self):
+        adapters = [
+            adapter
             for block in self.transformer.h
             if block.attn_relax is not None
             for relax in (block.attn_relax, block.mlp_relax)
             for adapter in relax
         ]
-        if not b2_params:
-            return None
-        sq_sum = torch.zeros((), device=b2_params[0].device, dtype=torch.float32)
-        numel = 0
-        for p in b2_params:
-            sq_sum += p.float().square().sum()
-            numel += p.numel()
-        return (sq_sum / numel).sqrt()
+        if not adapters:
+            return {}
+        return {
+            "hira/a_rms": self._rms([p for a in adapters for p in (a.A_1, a.A_2)]),
+            "hira/b_rms": self._rms([p for a in adapters for p in (a.B_1, a.B_2)]),
+            "hira/a1_rms": self._rms([a.A_1 for a in adapters]),
+            "hira/a2_rms": self._rms([a.A_2 for a in adapters]),
+            "hira/b1_rms": self._rms([a.B_1 for a in adapters]),
+            "hira/b2_rms": self._rms([a.B_2 for a in adapters]),
+        }
 
     def _default_fixed_weights(self):
         if self.num_iterations == 3:
@@ -633,10 +649,18 @@ class GPT(nn.Module):
     def setup_optimizer(self, optimizer_name="muon"):
         ddp, rank, local_rank, world_size = get_dist_info()
         matrix_params = (
-            list(self.transformer.h.parameters())
+            [p for block in self.transformer.h for p in block.attn.parameters()]
+            + [p for block in self.transformer.h for p in block.mlp.parameters()]
             + list(self.ve_projs.parameters())
             + list(self.skip_projs.parameters())
         )
+        hira_params = [
+            p
+            for block in self.transformer.h
+            for relax in (block.attn_relax, block.mlp_relax)
+            if relax is not None
+            for p in relax.parameters()
+        ]
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -696,6 +720,18 @@ class GPT(nn.Module):
                     weight_decay=WEIGHT_DECAY,
                 )
             )
+            if hira_params:
+                param_groups.append(
+                    dict(
+                        kind="adamw",
+                        params=hira_params,
+                        lr=MATRIX_LR,
+                        betas=ADAM_BETAS,
+                        eps=1e-10,
+                        weight_decay=WEIGHT_DECAY,
+                        hira=True,
+                    )
+                )
         else:
             for shape in sorted({p.shape for p in matrix_params}):
                 group_params = [p for p in matrix_params if p.shape == shape]
@@ -708,6 +744,20 @@ class GPT(nn.Module):
                         ns_steps=5,
                         beta2=0.95,
                         weight_decay=WEIGHT_DECAY,
+                    )
+                )
+            for shape in sorted({p.shape for p in hira_params}):
+                group_params = [p for p in hira_params if p.shape == shape]
+                param_groups.append(
+                    dict(
+                        kind="muon",
+                        params=group_params,
+                        lr=MATRIX_LR,
+                        momentum=0.95,
+                        ns_steps=5,
+                        beta2=0.95,
+                        weight_decay=WEIGHT_DECAY,
+                        hira=True,
                     )
                 )
 
@@ -1342,6 +1392,8 @@ while current_epoch <= args.num_epochs:
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
+        if group.get("hira", False) and current_epoch == 1:
+            group["lr"] = 0.0
         if group["kind"] == "muon":
             group["momentum"] = get_muon_momentum(step)
     adaptive_clip_grad_(model.parameters(), args.agc_clip_factor)
@@ -1389,9 +1441,9 @@ while current_epoch <= args.num_epochs:
         "train/weighted_loss": debiased_weighted,
         "train/mfu": mfu,
     }
-    hira_b2_rms = orig_model.get_hira_b2_rms()
-    if hira_b2_rms is not None:
-        wandb_payload["hira/b2_rms"] = hira_b2_rms.item()
+    hira_rms = orig_model.get_hira_rms()
+    if hira_rms:
+        wandb_payload.update({k: v.item() for k, v in hira_rms.items()})
     wandb_run.log(wandb_payload)
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
