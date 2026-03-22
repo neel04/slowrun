@@ -89,7 +89,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
-WARMUP_RATIO = 0.1
+WARMUP_RATIO = 0.02
 WARMDOWN_RATIO = 0.05
 FINAL_LR_FRAC = 0.0
 
@@ -393,19 +393,21 @@ class Block(nn.Module):
             self.attn_relax = None
             self.mlp_relax = None
 
-    def forward(self, x, ve, cos_sin, window_size, iteration_idx):
+    def forward(self, x, ve, cos_sin, window_size, iteration_idx, detach_adapters=False):
         x_norm = norm(x)
         attn_out = self.attn(x_norm, ve, cos_sin, window_size)
 
         if self.attn_relax is not None:
-            attn_out += new_gelu(self.attn_relax[iteration_idx](x_norm))
+            adapter_out = new_gelu(self.attn_relax[iteration_idx](x_norm))
+            attn_out = attn_out + (adapter_out.detach() if detach_adapters else adapter_out)
 
         x = x + attn_out
         x_norm = norm(x)
         mlp_out = self.mlp(x_norm)
 
         if self.mlp_relax is not None:
-            mlp_out += new_gelu(self.mlp_relax[iteration_idx](x_norm))
+            adapter_out = new_gelu(self.mlp_relax[iteration_idx](x_norm))
+            mlp_out = mlp_out + (adapter_out.detach() if detach_adapters else adapter_out)
 
         x = x + mlp_out
         return x
@@ -610,7 +612,6 @@ class GPT(nn.Module):
             if relax is not None
             for p in relax.parameters()
         ]
-        ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         skip_params = [self.skip_weights]
@@ -631,15 +632,7 @@ class GPT(nn.Module):
                 lr=EMBEDDING_LR,
                 betas=ADAM_BETAS,
                 eps=1e-10,
-                weight_decay=WEIGHT_DECAY,
-            ),
-            dict(
-                kind="adamw",
-                params=ve_params,
-                lr=EMBEDDING_LR,
-                betas=ADAM_BETAS,
-                eps=1e-10,
-                weight_decay=WEIGHT_DECAY,
+                weight_decay=0.0,
             ),
             dict(
                 kind="adamw",
@@ -677,7 +670,7 @@ class GPT(nn.Module):
                         lr=MATRIX_LR,
                         betas=ADAM_BETAS,
                         eps=1e-10,
-                        weight_decay=WEIGHT_DECAY,
+                        weight_decay=0.0,
                         hira=True,
                     )
                 )
@@ -720,6 +713,7 @@ class GPT(nn.Module):
         idx,
         targets=None,
         loss_reduction="mean",
+        detach_adapters=False,
     ):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -739,7 +733,7 @@ class GPT(nn.Module):
                     x = x + self.skip_weights[i - self.encoder_layers] * skip
 
                 ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-                x = block(x, ve, cos_sin, self.window_sizes[i], iteration)
+                x = block(x, ve, cos_sin, self.window_sizes[i], iteration, detach_adapters)
 
                 if i < self.encoder_layers:
                     skip_connections.append(x)
@@ -982,12 +976,18 @@ class DistMuonAdamW(torch.optim.Optimizer):
         rank, world_size = dist.get_rank(), dist.get_world_size()
         reduce_infos = []
         for group in self.param_groups:
+            # Skip groups where all params have no gradient (e.g. frozen HiRA)
+            if all(p.grad is None for p in group["params"]):
+                reduce_infos.append(None)
+                continue
             if group["kind"] == "adamw":
                 reduce_infos.append(self._reduce_adamw(group, world_size))
             elif group["kind"] == "muon":
                 reduce_infos.append(self._reduce_muon(group, world_size))
         gather_list = []
         for group, info in zip(self.param_groups, reduce_infos):
+            if info is None:
+                continue
             if group["kind"] == "adamw":
                 self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group["kind"] == "muon":
@@ -1288,9 +1288,10 @@ while current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
+    hira_frozen = current_epoch <= args.num_epochs // 2
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x, y, detach_adapters=hira_frozen)
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
@@ -1299,7 +1300,7 @@ while current_epoch <= args.num_epochs:
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group.get("hira", False) and current_epoch == 1:
+        if group.get("hira", False) and hira_frozen:
             group["lr"] = 0.0
         if group["kind"] == "muon":
             group["momentum"] = get_muon_momentum(step)
