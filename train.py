@@ -50,9 +50,7 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--z-loss-coeff", type=float, default=1e-4)
 parser.add_argument("--optimizer", type=str, choices=("muon", "adamw"), default="muon")
-parser.add_argument("--agc-clip-factor", type=float, default=0.015)
 parser.add_argument("--hira-rank", type=int, default=32)
 args = parser.parse_args()
 
@@ -114,27 +112,6 @@ def get_dist_info():
 def print0(s="", **kwargs):
     if int(os.environ.get("RANK", 0)) == 0:
         print(s, **kwargs)
-
-
-def _unitwise_norm(x, eps=1e-6):
-    if x.ndim <= 1:
-        return x.norm().clamp_min(eps)
-    dim = tuple(range(1, x.ndim))
-    return x.norm(dim=dim, keepdim=True).clamp_min(eps)
-
-
-@torch.no_grad()
-def adaptive_clip_grad_(parameters, clip_factor, eps=1e-3):
-    if clip_factor <= 0:
-        return
-    for p in parameters:
-        if p.grad is None or p.ndim <= 1:
-            continue
-        param_norm = _unitwise_norm(p.detach(), eps)
-        grad_norm = _unitwise_norm(p.grad.detach(), eps)
-        max_norm = param_norm * clip_factor
-        clip_scale = (max_norm / grad_norm).clamp(max=1.0)
-        p.grad.mul_(clip_scale)
 
 class DummyWandb:
     def __init__(self):
@@ -255,7 +232,6 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
-    z_loss_coeff: float = 0.0
     num_iterations: int = NUM_ITERATIONS
     hira_rank: int = 8
 
@@ -574,7 +550,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x)[..., : self.config.vocab_size].float()
         return 15 * torch.tanh(logits / 15)  # softcap
 
-    def _compute_loss(self, logits, targets, loss_reduction, include_z_loss):
+    def _compute_loss(self, logits, targets, loss_reduction):
         ce = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
@@ -582,16 +558,12 @@ class GPT(nn.Module):
             reduction="none",
         )
         valid = targets.view(-1) != -1
-        total = ce
-        if include_z_loss and self.config.z_loss_coeff != 0.0:
-            z = logits.logsumexp(dim=-1).square().view(-1)
-            total = total + self.config.z_loss_coeff * z * valid
         if loss_reduction == "none":
-            return total
+            return ce
         if loss_reduction == "sum":
-            return total[valid].sum()
+            return ce[valid].sum()
         if loss_reduction == "mean":
-            return total[valid].mean()
+            return ce[valid].mean()
         raise ValueError(f"Unsupported loss_reduction={loss_reduction}")
 
     def estimate_flops(self):
@@ -748,8 +720,6 @@ class GPT(nn.Module):
         idx,
         targets=None,
         loss_reduction="mean",
-        include_z_loss=True,
-        return_loss_breakdown=False,
     ):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -757,10 +727,13 @@ class GPT(nn.Module):
         x0 = x
 
         for iteration in range(self.num_iterations):
-            x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
             skip_connections = []
 
             for i, block in enumerate(self.transformer.h):
+                # concat after the bottleneck
+                if i == self.encoder_layers:
+                    x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
+
                 if i >= self.encoder_layers and skip_connections:
                     skip = skip_connections.pop()
                     x = x + self.skip_weights[i - self.encoder_layers] * skip
@@ -777,13 +750,7 @@ class GPT(nn.Module):
         logits = self._compute_logits(x)
 
         if targets is not None:
-            loss = self._compute_loss(logits, targets, loss_reduction, include_z_loss)
-            if return_loss_breakdown:
-                final_loss = self._compute_loss(
-                    logits, targets, loss_reduction, include_z_loss=False
-                )
-                return loss, final_loss
-            return loss
+            return self._compute_loss(logits, targets, loss_reduction)
         return logits
 
 
@@ -1109,7 +1076,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, _ = next(batch_iter)
-        loss2d = model(x, y, loss_reduction="none", include_z_loss=False).view(-1)
+        loss2d = model(x, y, loss_reduction="none").view(-1)
         y = y.view(-1)
         mask = y != -1
         total_loss += loss2d[mask].sum()
@@ -1203,9 +1170,7 @@ print0(
 )
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
-print0(f"  z_loss_coeff={args.z_loss_coeff}")
 print0(f"  optimizer={args.optimizer}")
-print0(f"  agc_clip_factor={args.agc_clip_factor}")
 print0("-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -1226,7 +1191,6 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 config = GPTConfig(
     vocab_size=vocab_size,
     dropout=args.dropout,
-    z_loss_coeff=args.z_loss_coeff,
     hira_rank=args.hira_rank,
 )
 with torch.device("meta"):
@@ -1324,18 +1288,12 @@ while current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
-    train_loss = torch.zeros((), dtype=torch.float32, device=device)
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss, final_loss = model(x, y, return_loss_breakdown=True)
-        train_loss += final_loss.detach().float()
+            loss = model(x, y)
+        train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
-
-    train_loss /= grad_accum_steps
-    if dist.is_initialized():
-        dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
-        train_loss /= ddp_world_size
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
@@ -1345,7 +1303,6 @@ while current_epoch <= args.num_epochs:
             group["lr"] = 0.0
         if group["kind"] == "muon":
             group["momentum"] = get_muon_momentum(step)
-    adaptive_clip_grad_(model.parameters(), args.agc_clip_factor)
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
