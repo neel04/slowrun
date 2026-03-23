@@ -444,6 +444,7 @@ class GPT(nn.Module):
             nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
             for _ in range(self.num_iterations)
         ])
+        self.concat_gate = nn.Parameter(torch.ones(config.n_layer))
         self.iter_norms = nn.ModuleList([
             RMSNorm(config.n_embd) for _ in range(self.num_iterations)
         ])
@@ -614,7 +615,7 @@ class GPT(nn.Module):
         ]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        skip_params = [self.skip_weights]
+        skip_params = [self.skip_weights, self.concat_gate]
         iter_norm_params = list(self.iter_norms.parameters())
 
         param_groups = [
@@ -726,7 +727,7 @@ class GPT(nn.Module):
             for i, block in enumerate(self.transformer.h):
                 # concat after the bottleneck
                 if i == self.encoder_layers:
-                    x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
+                    x += self.concat_gate[i] * self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
 
                 if i >= self.encoder_layers and skip_connections:
                     skip = skip_connections.pop()
