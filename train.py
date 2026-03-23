@@ -393,21 +393,19 @@ class Block(nn.Module):
             self.attn_relax = None
             self.mlp_relax = None
 
-    def forward(self, x, ve, cos_sin, window_size, iteration_idx, detach_adapters=False):
+    def forward(self, x, ve, cos_sin, window_size, iteration_idx):
         x_norm = norm(x)
         attn_out = self.attn(x_norm, ve, cos_sin, window_size)
 
         if self.attn_relax is not None:
-            adapter_out = new_gelu(self.attn_relax[iteration_idx](x_norm))
-            attn_out = attn_out + (adapter_out.detach() if detach_adapters else adapter_out)
+            attn_out = attn_out + new_gelu(self.attn_relax[iteration_idx](x_norm))
 
         x = x + attn_out
         x_norm = norm(x)
         mlp_out = self.mlp(x_norm)
 
         if self.mlp_relax is not None:
-            adapter_out = new_gelu(self.mlp_relax[iteration_idx](x_norm))
-            mlp_out = mlp_out + (adapter_out.detach() if detach_adapters else adapter_out)
+            mlp_out = mlp_out + new_gelu(self.mlp_relax[iteration_idx](x_norm))
 
         x = x + mlp_out
         return x
@@ -483,6 +481,9 @@ class GPT(nn.Module):
                     adapter.reset_parameters()
 
         self.skip_weights.fill_(1.0)
+        self.concat_gate.fill_(1.0)
+        for iter_norm in self.iter_norms:
+            iter_norm.scale.fill_(1.0)
 
         for proj in self.skip_projs:
             torch.nn.init.uniform_(proj.weight, -s, s)
@@ -714,7 +715,6 @@ class GPT(nn.Module):
         idx,
         targets=None,
         loss_reduction="mean",
-        detach_adapters=False,
     ):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -734,7 +734,7 @@ class GPT(nn.Module):
                     x = x + self.skip_weights[i - self.encoder_layers] * skip
 
                 ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-                x = block(x, ve, cos_sin, self.window_sizes[i], iteration, detach_adapters)
+                x = block(x, ve, cos_sin, self.window_sizes[i], iteration)
 
                 if i < self.encoder_layers:
                     skip_connections.append(x)
@@ -1289,10 +1289,9 @@ while current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
-    hira_frozen = current_epoch <= args.num_epochs // 2
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y, detach_adapters=hira_frozen)
+            loss = model(x, y)
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
@@ -1301,7 +1300,7 @@ while current_epoch <= args.num_epochs:
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group.get("hira", False):
+        if group.get("hira", False) and current_epoch == 1:
             group["lr"] = 0.0
         if group["kind"] == "muon":
             group["momentum"] = get_muon_momentum(step)
