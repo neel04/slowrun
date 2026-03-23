@@ -90,7 +90,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.02
-WARMDOWN_RATIO = 0.05
+WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
