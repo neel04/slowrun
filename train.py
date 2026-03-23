@@ -1300,7 +1300,7 @@ while current_epoch <= args.num_epochs:
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group.get("hira", False) and hira_frozen:
+        if group.get("hira", False):
             group["lr"] = 0.0
         if group["kind"] == "muon":
             group["momentum"] = get_muon_momentum(step)
