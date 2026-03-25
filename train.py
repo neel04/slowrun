@@ -90,7 +90,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.02
-WARMDOWN_RATIO = 0.5
+WARMDOWN_RATIO = 0.25
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
@@ -426,6 +426,8 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
+        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.ve_projs = nn.ModuleDict({
@@ -466,6 +468,9 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+        self.resid_lambdas.fill_(1.0)
+        self.x0_lambdas.fill_(0.1)
 
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
@@ -616,6 +621,8 @@ class GPT(nn.Module):
         ]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        resid_params = [self.resid_lambdas]
+        x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights, self.concat_gate]
         iter_norm_params = list(self.iter_norms.parameters())
 
@@ -633,6 +640,22 @@ class GPT(nn.Module):
                 params=embed_params,
                 lr=EMBEDDING_LR,
                 betas=ADAM_BETAS,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=resid_params,
+                lr=SCALAR_LR * 0.01,
+                betas=ADAM_BETAS,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=x0_params,
+                lr=SCALAR_LR,
+                betas=(0.96, 0.95),
                 eps=1e-10,
                 weight_decay=0.0,
             ),
@@ -733,6 +756,7 @@ class GPT(nn.Module):
                     skip = skip_connections.pop()
                     x = x + self.skip_weights[i - self.encoder_layers] * skip
 
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                 ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
                 x = block(x, ve, cos_sin, self.window_sizes[i], iteration)
 
