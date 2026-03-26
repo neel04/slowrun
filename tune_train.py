@@ -51,6 +51,8 @@ def parse_args():
     parser.add_argument("--print-trial-logs", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="slowrun")
     parser.add_argument("--wandb-group", type=str, default="hypertune")
+    parser.add_argument("--compile-cache-dir", type=str, default="/tmp/slowrun_torchinductor")
+    parser.add_argument("--error-log", type=str, default="/tmp/slowrun_tuner_errors.log")
     return parser.parse_known_args()
 
 
@@ -128,11 +130,17 @@ def main():
                 "optimizer": args.optimizer,
                 "wandb_project": args.wandb_project,
                 "wandb_group": wandb_group,
+                "compile_cache_dir": args.compile_cache_dir,
+                "error_log": args.error_log,
                 "search_space": SEARCH_SPACE,
             },
             indent=2,
         )
     )
+    error_log_path = Path(args.error_log)
+    error_log_path.parent.mkdir(parents=True, exist_ok=True)
+    if error_log_path.exists():
+        error_log_path.unlink()
     sampler = optuna.samplers.TPESampler(
         seed=args.seed,
         multivariate=True,
@@ -166,7 +174,8 @@ def main():
             env["WANDB_MODE"] = "disabled"
             env["WANDB_SILENT"] = "true"
             env.setdefault("PYTHONHASHSEED", str(args.seed))
-            env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            env.setdefault("TORCHINDUCTOR_CACHE_DIR", args.compile_cache_dir)
+            env.setdefault("TRITON_CACHE_DIR", os.path.join(args.compile_cache_dir, "triton"))
             proc = subprocess.run(
                 cmd,
                 cwd=Path(__file__).resolve().parent,
@@ -185,6 +194,14 @@ def main():
             if proc.returncode != 0:
                 trial.set_user_attr("returncode", proc.returncode)
                 trial.set_user_attr("output_tail", "\n".join(output.splitlines()[-50:]))
+                with error_log_path.open("a") as f:
+                    f.write(f"=== Trial {trial.number} failed ===\n")
+                    f.write(f"Return code: {proc.returncode}\n")
+                    f.write(f"Command: {' '.join(cmd)}\n")
+                    f.write(output)
+                    if not output.endswith("\n"):
+                        f.write("\n")
+                    f.write("\n")
                 return float("inf")
             with result_path.open() as f:
                 result = json.load(f)
