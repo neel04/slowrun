@@ -34,10 +34,18 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--study-name", type=str, default="slowrun-tpe")
     parser.add_argument("--storage", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--train-fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--train-fraction",
+        "--train_fraction",
+        dest="train_fraction",
+        type=float,
+        default=0.2,
+    )
     parser.add_argument("--input_bin", type=str, default=None)
     parser.add_argument("--input_val_bin", type=str, default=None)
-    parser.add_argument("--n-layer", type=int, default=None)
+    parser.add_argument(
+        "--n_layer", "--n_layers", dest="n_layer", type=int, default=None
+    )
     parser.add_argument("--patience", type=int, default=0)
     parser.add_argument(
         "--optimizer",
@@ -45,16 +53,40 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         choices=("muon", "adamw", "search"),
         default="muon",
     )
-    parser.add_argument("--device-batch-size", type=int, default=None)
-    parser.add_argument("--total-batch-size", type=int, default=None)
-    parser.add_argument("--output-json", type=str, default="")
+    parser.add_argument(
+        "--device-batch-size",
+        "--device_batch_size",
+        dest="device_batch_size",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--total-batch-size",
+        "--total_batch_size",
+        dest="total_batch_size",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--output-json", "--output_json", dest="output_json", type=str, default=""
+    )
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--train-script", type=str, default="train.py")
     parser.add_argument("--print-trial-logs", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="slowrun")
-    parser.add_argument("--wandb-group", type=str, default="hypertune")
-    parser.add_argument("--compile-cache-dir", type=str, default="/tmp/slowrun_torchinductor")
-    parser.add_argument("--error-log", type=str, default="/tmp/slowrun_tuner_errors.log")
+    parser.add_argument(
+        "--wandb-group",
+        "--wandb_group",
+        dest="wandb_group",
+        type=str,
+        default="hypertune",
+    )
+    parser.add_argument(
+        "--compile-cache-dir", type=str, default="/tmp/slowrun_torchinductor"
+    )
+    parser.add_argument(
+        "--error-log", type=str, default="/tmp/slowrun_tuner_errors.log"
+    )
     return parser.parse_known_args()
 
 
@@ -62,7 +94,22 @@ def fixed_or_suggest[T](fixed_value: T | None, suggest_fn: Callable[[], T]) -> T
     return fixed_value if fixed_value is not None else suggest_fn()
 
 
-def stream_subprocess(cmd: list[str], env: dict[str, str], log_path: Path) -> tuple[int, str]:
+def get_fixed_overrides(args: argparse.Namespace) -> dict[str, object]:
+    overrides: dict[str, object] = {}
+    if args.optimizer != "search":
+        overrides["optimizer"] = args.optimizer
+    if args.n_layer is not None:
+        overrides["n_layer"] = args.n_layer
+    if args.total_batch_size is not None:
+        overrides["total_batch_size"] = args.total_batch_size
+    if args.device_batch_size is not None:
+        overrides["device_batch_size"] = args.device_batch_size
+    return overrides
+
+
+def stream_subprocess(
+    cmd: list[str], env: dict[str, str], log_path: Path
+) -> tuple[int, str]:
     lines: list[str] = []
     with log_path.open("w") as log_file:
         proc = subprocess.Popen(
@@ -162,6 +209,7 @@ def build_command(
 
 def main() -> None:
     args, passthrough = parse_args()
+    fixed_overrides = get_fixed_overrides(args)
 
     wandb_group = (
         args.wandb_group
@@ -184,6 +232,11 @@ def main() -> None:
             indent=2,
         )
     )
+    print("--- Fixed Overrides ---")
+    print(json.dumps(fixed_overrides, indent=2) if fixed_overrides else "{}")
+    if passthrough:
+        print("--- Passthrough Args ---")
+        print(json.dumps(passthrough, indent=2))
 
     error_log_path = Path(args.error_log)
     error_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,7 +279,9 @@ def main() -> None:
             env["WANDB_SILENT"] = "true"
             env.setdefault("PYTHONHASHSEED", str(args.seed))
             env.setdefault("TORCHINDUCTOR_CACHE_DIR", args.compile_cache_dir)
-            env.setdefault("TRITON_CACHE_DIR", os.path.join(args.compile_cache_dir, "triton"))
+            env.setdefault(
+                "TRITON_CACHE_DIR", os.path.join(args.compile_cache_dir, "triton")
+            )
             print(f"=== Trial {trial.number} ===")
             print(f"Command: {' '.join(cmd)}")
             print(f"Live log: {trial_log_path}")
