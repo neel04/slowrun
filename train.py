@@ -53,6 +53,7 @@ parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--optimizer", type=str, choices=("muon", "adamw"), default="muon")
 parser.add_argument("--hira-rank", type=int, default=32)
 parser.add_argument("--train-fraction", type=float, default=1.0)
+parser.add_argument("--warmup-ratio", type=float, default=0.02)
 args = parser.parse_args()
 
 # Resolve output path
@@ -90,7 +91,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
-WARMUP_RATIO = 0.02
+WARMUP_RATIO = args.warmup_ratio
 WARMDOWN_RATIO = 0.25
 FINAL_LR_FRAC = 0.0
 

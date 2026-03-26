@@ -2,10 +2,10 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 import optuna
 import wandb
@@ -17,15 +17,16 @@ except ImportError:
 
 
 SEARCH_SPACE = {
-    "n_layer": [5, 10, 15],
+    "n_layer": [10, 15, 20],
     "num_epochs": list(range(1, 11)),
     "hira_rank": [0, 16, 32, 64],
     "lr_multiplier": [0.0, 0.05, 0.1, 0.2, 0.25, 0.3, 0.4, 0.5],
+    "warmup_ratio": [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5],
     "total_batch_size": [131072, 262144, 524288],
 }
 
 
-def parse_args():
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
         description="Hyperparameter tuning wrapper for train.py using Optuna TPE."
     )
@@ -36,6 +37,7 @@ def parse_args():
     parser.add_argument("--train-fraction", type=float, default=0.2)
     parser.add_argument("--input_bin", type=str, default=None)
     parser.add_argument("--input_val_bin", type=str, default=None)
+    parser.add_argument("--n-layer", type=int, default=None)
     parser.add_argument("--patience", type=int, default=0)
     parser.add_argument(
         "--optimizer",
@@ -56,27 +58,47 @@ def parse_args():
     return parser.parse_known_args()
 
 
-def build_command(args, passthrough, trial, result_path):
+def fixed_or_suggest[T](fixed_value: T | None, suggest_fn: Callable[[], T]) -> T:
+    return fixed_value if fixed_value is not None else suggest_fn()
+
+
+def build_command(
+    args: argparse.Namespace,
+    passthrough: list[str],
+    trial: optuna.trial.Trial,
+    result_path: Path,
+) -> list[str]:
     optimizer = (
         trial.suggest_categorical("optimizer", ["muon", "adamw"])
         if args.optimizer == "search"
         else args.optimizer
     )
-    n_layer = trial.suggest_categorical("n_layer", SEARCH_SPACE["n_layer"])
+
+    n_layer = fixed_or_suggest(
+        args.n_layer,
+        lambda: trial.suggest_categorical("n_layer", SEARCH_SPACE["n_layer"]),
+    )
+
     num_epochs = trial.suggest_categorical("num_epochs", SEARCH_SPACE["num_epochs"])
     hira_rank = trial.suggest_categorical("hira_rank", SEARCH_SPACE["hira_rank"])
     lr_multiplier = trial.suggest_categorical(
         "lr_multiplier", SEARCH_SPACE["lr_multiplier"]
     )
+
+    warmup_ratio = trial.suggest_categorical(
+        "warmup_ratio", SEARCH_SPACE["warmup_ratio"]
+    )
+
     dropout = trial.suggest_float("dropout", 0.0, 0.5)
     weight_decay = trial.suggest_float("weight_decay", 0.0, 0.5)
-    total_batch_size = (
-        args.total_batch_size
-        if args.total_batch_size is not None
-        else trial.suggest_categorical(
+
+    total_batch_size = fixed_or_suggest(
+        args.total_batch_size,
+        lambda: trial.suggest_categorical(
             "total_batch_size", SEARCH_SPACE["total_batch_size"]
-        )
+        ),
     )
+
     cmd = [
         "torchrun",
         "--standalone",
@@ -92,6 +114,8 @@ def build_command(args, passthrough, trial, result_path):
         str(dropout),
         "--lr_multiplier",
         str(lr_multiplier),
+        "--warmup-ratio",
+        str(warmup_ratio),
         "--weight-decay",
         str(weight_decay),
         "--num-epochs",
@@ -115,13 +139,15 @@ def build_command(args, passthrough, trial, result_path):
     return cmd
 
 
-def main():
+def main() -> None:
     args, passthrough = parse_args()
+
     wandb_group = (
         args.wandb_group
         if args.wandb_group
         else f"optuna-{args.study_name}-{time.strftime('%Y%m%d_%H%M%S')}"
     )
+
     print(
         json.dumps(
             {
@@ -137,8 +163,10 @@ def main():
             indent=2,
         )
     )
+
     error_log_path = Path(args.error_log)
     error_log_path.parent.mkdir(parents=True, exist_ok=True)
+
     if error_log_path.exists():
         error_log_path.unlink()
     sampler = optuna.samplers.TPESampler(
@@ -153,6 +181,7 @@ def main():
         direction="minimize",
         sampler=sampler,
     )
+
     wandb_callback = WeightsAndBiasesCallback(
         metric_name="best_val_loss",
         wandb_kwargs={
