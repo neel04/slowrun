@@ -52,6 +52,7 @@ parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--optimizer", type=str, choices=("muon", "adamw"), default="muon")
 parser.add_argument("--hira-rank", type=int, default=32)
+parser.add_argument("--train-fraction", type=float, default=1.0)
 args = parser.parse_args()
 
 # Resolve output path
@@ -1029,7 +1030,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
 class DataLoader:
     """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever."""
 
-    def __init__(self, filepath, B, T, device="cuda"):
+    def __init__(self, filepath, B, T, device="cuda", fraction=1.0):
         data = torch.load(filepath, weights_only=True)
         chunks = data["chunks"]
         valid_counts = data["valid_counts"]
@@ -1045,10 +1046,18 @@ class DataLoader:
             rows = chunk.view(file_B, sequence_size)[:vc]
             all_seqs.append(rows)
         all_seqs = torch.cat(all_seqs, dim=0).long()  # (N, T+1)
+        if not (0.0 < fraction <= 1.0):
+            raise ValueError(f"fraction must be in (0, 1], got {fraction}")
 
         # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
         seqs_per_step = B * world_size
+        if fraction < 1.0:
+            keep = max(seqs_per_step, int(len(all_seqs) * fraction))
+            g = torch.Generator()
+            g.manual_seed(1234)
+            perm = torch.randperm(len(all_seqs), generator=g)
+            all_seqs = all_seqs[perm[:keep]]
         num_steps = len(all_seqs) // seqs_per_step
         usable = num_steps * seqs_per_step
         all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
@@ -1247,10 +1256,17 @@ _val_path = (
     else os.path.join(DATA_DIR, "fineweb_val.pt")
 )
 train_loader = DataLoader(
-    _train_path, args.device_batch_size, MAX_SEQ_LEN, device=device
+    _train_path,
+    args.device_batch_size,
+    MAX_SEQ_LEN,
+    device=device,
+    fraction=args.train_fraction,
 )
 build_val_loader = lambda: DataLoader(
-    _val_path, args.device_batch_size, MAX_SEQ_LEN, device=device
+    _val_path,
+    args.device_batch_size,
+    MAX_SEQ_LEN,
+    device=device,
 )
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
@@ -1264,7 +1280,8 @@ num_iterations = round(
 )  # estimate for LR schedule
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
-print0(f"Eval set: {EVAL_TOKENS:,} tokens")
+val_loader = build_val_loader()
+print0(f"Eval set: {val_loader.total_tokens:,} tokens")
 
 
 # Schedulers
@@ -1291,11 +1308,10 @@ min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
-eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
+eval_steps = val_loader.num_steps
 
 # Initial val evaluation
 model.eval()
-val_loader = build_val_loader()
 with autocast_ctx:
     val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
 print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
