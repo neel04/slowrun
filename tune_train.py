@@ -62,6 +62,27 @@ def fixed_or_suggest[T](fixed_value: T | None, suggest_fn: Callable[[], T]) -> T
     return fixed_value if fixed_value is not None else suggest_fn()
 
 
+def stream_subprocess(cmd: list[str], env: dict[str, str], log_path: Path) -> tuple[int, str]:
+    lines: list[str] = []
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=Path(__file__).resolve().parent,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="")
+            log_file.write(line)
+            lines.append(line)
+        return_code = proc.wait()
+    return return_code, "".join(lines)
+
+
 def build_command(
     args: argparse.Namespace,
     passthrough: list[str],
@@ -198,6 +219,7 @@ def main() -> None:
             prefix=f"optuna-trial-{trial.number:04d}-"
         ) as tmpdir:
             result_path = Path(tmpdir) / "result.json"
+            trial_log_path = Path(tmpdir) / "trial.log"
             cmd = build_command(args, passthrough, trial, result_path)
             env = os.environ.copy()
             env["WANDB_MODE"] = "disabled"
@@ -205,28 +227,19 @@ def main() -> None:
             env.setdefault("PYTHONHASHSEED", str(args.seed))
             env.setdefault("TORCHINDUCTOR_CACHE_DIR", args.compile_cache_dir)
             env.setdefault("TRITON_CACHE_DIR", os.path.join(args.compile_cache_dir, "triton"))
-            proc = subprocess.run(
-                cmd,
-                cwd=Path(__file__).resolve().parent,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
-            output = proc.stdout
-            if args.print_trial_logs:
-                print(output, end="" if output.endswith("\n") else "\n")
-            else:
-                tail = "\n".join(output.splitlines()[-20:])
-                if tail:
-                    print(f"Trial {trial.number} tail:\n{tail}")
-            if proc.returncode != 0:
-                trial.set_user_attr("returncode", proc.returncode)
+            print(f"=== Trial {trial.number} ===")
+            print(f"Command: {' '.join(cmd)}")
+            print(f"Live log: {trial_log_path}")
+            return_code, output = stream_subprocess(cmd, env, trial_log_path)
+            if return_code != 0:
+                trial.set_user_attr("returncode", return_code)
                 trial.set_user_attr("output_tail", "\n".join(output.splitlines()[-50:]))
+                trial.set_user_attr("trial_log", str(trial_log_path))
                 with error_log_path.open("a") as f:
                     f.write(f"=== Trial {trial.number} failed ===\n")
-                    f.write(f"Return code: {proc.returncode}\n")
+                    f.write(f"Return code: {return_code}\n")
                     f.write(f"Command: {' '.join(cmd)}\n")
+                    f.write(f"Trial log: {trial_log_path}\n")
                     f.write(output)
                     if not output.endswith("\n"):
                         f.write("\n")
@@ -239,6 +252,7 @@ def main() -> None:
                 "val_loss", float(result.get("val_loss", best_val_loss))
             )
             trial.set_user_attr("command", " ".join(cmd))
+            trial.set_user_attr("trial_log", str(trial_log_path))
             wandb.config.update(
                 {
                     "study_name": args.study_name,
