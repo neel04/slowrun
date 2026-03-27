@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -20,10 +22,16 @@ SEARCH_SPACE = {
     "n_layer": [10, 15, 20],
     "num_epochs": list(range(1, 11)),
     "hira_rank": [0, 16, 32, 64],
-    "lr_multiplier": [0.0, 0.05, 0.1, 0.2, 0.25, 0.3, 0.4, 0.5],
+    "lr_multiplier": [0.05, 0.1, 0.2, 0.25, 0.3, 0.4, 0.5],
     "warmup_ratio": [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5],
     "total_batch_size": [131072, 262144, 524288],
 }
+
+TPE_STARTUP_TRIALS = 8
+PRUNE_PERCENTILE = 50.0
+EPOCH_VAL_LOSS_RE = re.compile(
+    r"Step\s+\d+\s+\|\s+Epoch\s+(\d+)\s+\|\s+Val BPB:\s+[0-9.eE+-]+\s+\|\s+Val Loss:\s+([0-9.eE+-]+)"
+)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -108,9 +116,13 @@ def get_fixed_overrides(args: argparse.Namespace) -> dict[str, object]:
 
 
 def stream_subprocess(
-    cmd: list[str], env: dict[str, str], log_path: Path
-) -> tuple[int, str]:
+    cmd: list[str],
+    env: dict[str, str],
+    log_path: Path,
+    on_line: Callable[[str], bool] | None = None,
+) -> tuple[int, str, bool]:
     lines: list[str] = []
+    pruned = False
     with log_path.open("w") as log_file:
         proc = subprocess.Popen(
             cmd,
@@ -120,14 +132,29 @@ def stream_subprocess(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
+            start_new_session=True,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
             print(line, end="")
             log_file.write(line)
             lines.append(line)
-        return_code = proc.wait()
-    return return_code, "".join(lines)
+            if on_line is not None and on_line(line):
+                pruned = True
+                os.killpg(proc.pid, signal.SIGTERM)
+                break
+        if pruned:
+            remainder = proc.stdout.read()
+            if remainder:
+                print(remainder, end="")
+                log_file.write(remainder)
+                lines.append(remainder)
+        try:
+            return_code = proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return_code = proc.wait()
+    return return_code, "".join(lines), pruned
 
 
 def build_command(
@@ -210,6 +237,7 @@ def build_command(
 def main() -> None:
     args, passthrough = parse_args()
     fixed_overrides = get_fixed_overrides(args)
+    storage = args.storage or f"sqlite:///{Path('/tmp') / f'{args.study_name}.db'}"
 
     wandb_group = (
         args.wandb_group
@@ -223,10 +251,13 @@ def main() -> None:
                 "train_fraction": args.train_fraction,
                 "seed": args.seed,
                 "optimizer": args.optimizer,
+                "storage": storage,
                 "wandb_project": args.wandb_project,
                 "wandb_group": wandb_group,
                 "compile_cache_dir": args.compile_cache_dir,
                 "error_log": args.error_log,
+                "tpe_startup_trials": TPE_STARTUP_TRIALS,
+                "prune_percentile": PRUNE_PERCENTILE,
                 "search_space": SEARCH_SPACE,
             },
             indent=2,
@@ -247,13 +278,21 @@ def main() -> None:
         seed=args.seed,
         multivariate=True,
         group=True,
+        n_startup_trials=TPE_STARTUP_TRIALS,
+    )
+    pruner = optuna.pruners.PercentilePruner(
+        percentile=PRUNE_PERCENTILE,
+        n_startup_trials=TPE_STARTUP_TRIALS,
+        n_warmup_steps=1,
+        interval_steps=1,
     )
     study = optuna.create_study(
         study_name=args.study_name,
-        storage=args.storage,
+        storage=storage,
         load_if_exists=True,
         direction="minimize",
         sampler=sampler,
+        pruner=pruner,
     )
 
     wandb_callback = WeightsAndBiasesCallback(
@@ -282,10 +321,29 @@ def main() -> None:
             env.setdefault(
                 "TRITON_CACHE_DIR", os.path.join(args.compile_cache_dir, "triton")
             )
+
+            def on_line(line: str) -> bool:
+                match = EPOCH_VAL_LOSS_RE.search(line)
+                if match is None:
+                    return False
+                epoch = int(match.group(1))
+                val_loss = float(match.group(2))
+                trial.report(val_loss, step=epoch)
+                wandb.log({"epoch": epoch, "epoch_val_loss": val_loss})
+                return trial.should_prune()
+
             print(f"=== Trial {trial.number} ===")
             print(f"Command: {' '.join(cmd)}")
             print(f"Live log: {trial_log_path}")
-            return_code, output = stream_subprocess(cmd, env, trial_log_path)
+            return_code, output, was_pruned = stream_subprocess(
+                cmd, env, trial_log_path, on_line=on_line
+            )
+            if was_pruned:
+                trial.set_user_attr("trial_log", str(trial_log_path))
+                trial.set_user_attr("pruned", True)
+                raise optuna.TrialPruned(
+                    f"Pruned at epoch checkpoint; see {trial_log_path}"
+                )
             if return_code != 0:
                 trial.set_user_attr("returncode", return_code)
                 trial.set_user_attr("output_tail", "\n".join(output.splitlines()[-50:]))
