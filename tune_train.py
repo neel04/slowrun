@@ -30,7 +30,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
         description="Hyperparameter tuning wrapper for train.py using Optuna TPE."
     )
-    parser.add_argument("--n-trials", type=int, default=80)
+    parser.add_argument("--n-trials", type=int, default=48)
     parser.add_argument("--study-name", type=str, default="slowrun-tpe")
     parser.add_argument("--storage", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -39,7 +39,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         "--train_fraction",
         dest="train_fraction",
         type=float,
-        default=0.2,
+        default=1.0,
     )
     parser.add_argument("--input_bin", type=str, default=None)
     parser.add_argument("--input_val_bin", type=str, default=None)
