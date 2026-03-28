@@ -20,12 +20,25 @@ except ImportError:
 
 SEARCH_SPACE = {
     "n_layer": [10, 15, 20],
-    "num_epochs": list(range(1, 11)),
+    "num_epochs": (1, 10),
     "hira_rank": [0, 16, 32, 64],
-    "lr_multiplier": [0.05, 0.1, 0.2, 0.25, 0.3, 0.4, 0.5],
-    "warmup_ratio": [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5],
+    "lr_multiplier": (0.05, 0.5),
+    "warmup_ratio": (0.02, 0.5),
     "total_batch_size": [131072, 262144, 524288],
 }
+
+SEED_TRIALS = [
+    {
+        "n_layer": 15,
+        "num_epochs": 6,
+        "hira_rank": 32,
+        "lr_multiplier": 0.25,
+        "warmup_ratio": 0.02,
+        "dropout": 0.05,
+        "weight_decay": 1.0,
+        "total_batch_size": 524288,
+    },
+]
 
 TPE_STARTUP_TRIALS = 8
 PRUNE_PERCENTILE = 50.0
@@ -174,18 +187,16 @@ def build_command(
         lambda: trial.suggest_categorical("n_layer", SEARCH_SPACE["n_layer"]),
     )
 
-    num_epochs = trial.suggest_categorical("num_epochs", SEARCH_SPACE["num_epochs"])
+    num_epochs = trial.suggest_int("num_epochs", *SEARCH_SPACE["num_epochs"])
     hira_rank = trial.suggest_categorical("hira_rank", SEARCH_SPACE["hira_rank"])
-    lr_multiplier = trial.suggest_categorical(
-        "lr_multiplier", SEARCH_SPACE["lr_multiplier"]
+    lr_multiplier = trial.suggest_float(
+        "lr_multiplier", *SEARCH_SPACE["lr_multiplier"], log=True
     )
 
-    warmup_ratio = trial.suggest_categorical(
-        "warmup_ratio", SEARCH_SPACE["warmup_ratio"]
-    )
+    warmup_ratio = trial.suggest_float("warmup_ratio", *SEARCH_SPACE["warmup_ratio"])
 
     dropout = trial.suggest_float("dropout", 0.0, 0.5)
-    weight_decay = trial.suggest_float("weight_decay", 0.0, 0.5)
+    weight_decay = trial.suggest_float("weight_decay", 0.0, 2.0)
 
     total_batch_size = fixed_or_suggest(
         args.total_batch_size,
@@ -294,6 +305,9 @@ def main() -> None:
         sampler=sampler,
         pruner=pruner,
     )
+
+    for params in SEED_TRIALS:
+        study.enqueue_trial(params, skip_if_exists=True)
 
     wandb_callback = WeightsAndBiasesCallback(
         metric_name="best_val_loss",
