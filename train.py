@@ -247,17 +247,6 @@ def new_gelu(x):
     return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * x.pow(3.0))))
 
 
-class RMSNorm(nn.Module):
-    """Learnable RMSNorm so each iteration gets unique norm weights."""
-
-    def __init__(self, dim):
-        super().__init__()
-        self.scale = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        return F.rms_norm(x, (x.size(-1),)) * self.scale
-
-
 def has_ve(layer_idx, n_layer):
     """Value Embedding on alternating layers, last layer always included."""
     return layer_idx % 2 == (n_layer - 1) % 2
@@ -443,9 +432,6 @@ class GPT(nn.Module):
             nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
             for _ in range(self.num_iterations)
         ])
-        self.iter_norms = nn.ModuleList([
-            RMSNorm(config.n_embd) for _ in range(self.num_iterations)
-        ])
         self.iter_weight_mix_projs = nn.ModuleList([
             nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
             for _ in range(self.num_iterations)
@@ -489,9 +475,6 @@ class GPT(nn.Module):
                     adapter.reset_parameters()
                 for adapter in block.mlp_relax:
                     adapter.reset_parameters()
-
-        for iter_norm in self.iter_norms:
-            iter_norm.scale.fill_(1.0)
 
         for proj in self.iteration_mix_projs:
             torch.nn.init.uniform_(proj.weight, -s, s)
@@ -632,7 +615,6 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        iter_norm_params = list(self.iter_norms.parameters())
 
         param_groups = [
             dict(
@@ -664,14 +646,6 @@ class GPT(nn.Module):
                 params=x0_params,
                 lr=SCALAR_LR,
                 betas=(0.96, 0.95),
-                eps=1e-10,
-                weight_decay=0.0,
-            ),
-            dict(
-                kind="adamw",
-                params=iter_norm_params,
-                lr=SCALAR_LR,
-                betas=ADAM_BETAS,
                 eps=1e-10,
                 weight_decay=0.0,
             ),
@@ -755,8 +729,6 @@ class GPT(nn.Module):
                 ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
                 x = block(x, ve, cos_sin, self.window_sizes[i], iteration)
 
-            # Per-iteration learnable norm
-            x = self.iter_norms[iteration](x)
             iteration_latents[:, :, iteration, :] = x
             mix = self.iter_weight_mix_projs[iteration](torch.cat([x, x0], dim=-1))
             iteration_weight_logits[:, :, iteration] = self.iter_weight_heads[
