@@ -14,8 +14,10 @@ import math
 import time
 import json
 import argparse
+from collections.abc import Iterator
+from typing import cast
 from types import SimpleNamespace
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import nullcontext
 
 import torch
@@ -24,6 +26,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import wandb
 import tiktoken
+from torch import Tensor
 
 _script_start = time.time()
 
@@ -238,37 +241,30 @@ class GPTConfig:
     hira_rank: int = 8
 
 
-def norm(x):
+def norm(x: Tensor) -> Tensor:
     return F.rms_norm(x, (x.size(-1),))
 
 
-def new_gelu(x):
+def new_gelu(x: Tensor) -> Tensor:
     c = math.sqrt(2.0 / math.pi)
     return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * x.pow(3.0))))
 
 
-def has_ve(layer_idx, n_layer):
+def has_ve(layer_idx: int, n_layer: int) -> bool:
     """Value Embedding on alternating layers, last layer always included."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
-def apply_rotary_emb(x, cos, sin):
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], 3)
 
 
-def megatron_uniform_(tensor):
-    fan_in, fan_out = tensor.shape
-    std = (0.33 / fan_in) ** 0.5
-    lim = fan_out**-0.5
-    return torch.nn.init.uniform_(tensor, -lim, lim).mul_(std)
-
-
 class ABBA(nn.Module):
     """HiRA-style ABBA adapter used for per-iteration parameter relaxation."""
 
-    def __init__(self, in_dim, out_dim, rank):
+    def __init__(self, in_dim: int, out_dim: int, rank: int) -> None:
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -280,14 +276,14 @@ class ABBA(nn.Module):
         self.A_2 = nn.Parameter(torch.empty(rank, out_dim))
 
     @torch.no_grad()
-    def reset_parameters(self):
-        megatron_uniform_(self.B_1)
-        megatron_uniform_(self.A_1)
-        megatron_uniform_(self.B_2)
+    def reset_parameters(self) -> None:
+        torch.nn.init.xavier_uniform_(self.B_1)
+        torch.nn.init.xavier_uniform_(self.A_1)
+        torch.nn.init.xavier_uniform_(self.B_2)
         self.B_2.mul_(1e-3)
-        megatron_uniform_(self.A_2)
+        torch.nn.init.xavier_uniform_(self.A_2)
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         a_kr = (
             (self.A_1.mT.unsqueeze(-1) * self.A_2.mT.unsqueeze(-2))
             .reshape(self.out_dim, self.rank * self.rank)
@@ -300,7 +296,7 @@ class ABBA(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: GPTConfig, layer_idx: int) -> None:
         super().__init__()
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
@@ -326,7 +322,13 @@ class CausalSelfAttention(nn.Module):
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(
+        self,
+        x: Tensor,
+        ve: Tensor | None,
+        cos_sin: tuple[Tensor, Tensor],
+        window_size: tuple[int, int],
+    ) -> Tensor:
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -354,7 +356,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         hidden = 256 * ((8 * config.n_embd // 3 + 255) // 256)
         self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
@@ -362,12 +364,12 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: GPTConfig, layer_idx: int) -> None:
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
@@ -384,7 +386,14 @@ class Block(nn.Module):
             self.attn_relax = None
             self.mlp_relax = None
 
-    def forward(self, x, ve, cos_sin, window_size, iteration_idx):
+    def forward(
+        self,
+        x: Tensor,
+        ve: Tensor | None,
+        cos_sin: tuple[Tensor, Tensor],
+        window_size: tuple[int, int],
+        iteration_idx: int,
+    ) -> Tensor:
         x_norm = norm(x)
         attn_out = self.attn(x_norm, ve, cos_sin, window_size)
 
@@ -403,18 +412,25 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, config, pad_vocab_size_to=64):
+    def __init__(self, config: GPTConfig, pad_vocab_size_to: int = 64) -> None:
         super().__init__()
         self.config = config
+        if config.n_layer < 3:
+            raise ValueError("n_layer must be at least 3 for prelude/recurrent/post split")
         self.window_sizes = self._compute_window_sizes(config)
         padded_vocab = (
             (config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to
         ) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
+        prelude_config = replace(config, num_iterations=1)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "prelude": Block(prelude_config, 0),
+            "recurrent": nn.ModuleList([
+                Block(config, i) for i in range(1, config.n_layer - 1)
+            ]),
+            "post": Block(config, config.n_layer - 1),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -432,26 +448,55 @@ class GPT(nn.Module):
             nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
             for _ in range(self.num_iterations)
         ])
-        self.iter_weight_mix_projs = nn.ModuleList([
-            nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
-            for _ in range(self.num_iterations)
-        ])
-        self.iter_weight_heads = nn.ModuleList([
-            nn.Linear(config.n_embd, 1, bias=False) for _ in range(self.num_iterations)
-        ])
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
+    def _all_blocks(self) -> Iterator[Block]:
+        yield self._prelude_block()
+        yield from self._recurrent_blocks()
+        yield self._post_block()
+
+    def _shared_blocks(self) -> Iterator[Block]:
+        yield from self._recurrent_blocks()
+        yield self._post_block()
+
+    def _token_embedding(self) -> nn.Embedding:
+        return cast(nn.Embedding, self.transformer["wte"])
+
+    def _prelude_block(self) -> Block:
+        return cast(Block, self.transformer["prelude"])
+
+    def _recurrent_blocks(self) -> Iterator[Block]:
+        recurrent = cast(nn.ModuleList, self.transformer["recurrent"])
+        for block in recurrent:
+            yield cast(Block, block)
+
+    def _post_block(self) -> Block:
+        return cast(Block, self.transformer["post"])
+
+    def _run_block(
+        self,
+        block: Block,
+        layer_idx: int,
+        x: Tensor,
+        anchor: Tensor,
+        cos_sin: tuple[Tensor, Tensor],
+        iteration_idx: int,
+    ) -> Tensor:
+        x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * anchor
+        ve = self.ve_projs[str(layer_idx)](anchor) if str(layer_idx) in self.ve_projs else None
+        return block(x, ve, cos_sin, self.window_sizes[layer_idx], iteration_idx)
+
     @torch.no_grad()
-    def init_weights(self):
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+    def init_weights(self) -> None:
+        torch.nn.init.normal_(self._token_embedding().weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
         s = 3**0.5 * self.config.n_embd**-0.5
 
-        for block in self.transformer.h:
+        for block in self._all_blocks():
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
@@ -466,7 +511,7 @@ class GPT(nn.Module):
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
 
-        for block in self.transformer.h:
+        for block in self._all_blocks():
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
@@ -478,21 +523,19 @@ class GPT(nn.Module):
 
         for proj in self.iteration_mix_projs:
             torch.nn.init.uniform_(proj.weight, -s, s)
-        for proj in self.iter_weight_mix_projs:
-            torch.nn.init.uniform_(proj.weight, -s, s)
-        for head in self.iter_weight_heads:
-            torch.nn.init.zeros_(head.weight)
 
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
 
         self.cos, self.sin = cos, sin
 
-        if self.transformer.wte.weight.device.type == "cuda":
-            self.transformer.wte.to(dtype=torch.bfloat16)
+        if self._token_embedding().weight.device.type == "cuda":
+            self._token_embedding().to(dtype=torch.bfloat16)
 
-    def _precompute_rotary(self, seq_len, head_dim, base=10000):
-        device = self.transformer.wte.weight.device
+    def _precompute_rotary(
+        self, seq_len: int, head_dim: int, base: int = 10000
+    ) -> tuple[Tensor, Tensor]:
+        device = self._token_embedding().weight.device
         inv_freq = 1.0 / (
             base
             ** (
@@ -505,7 +548,7 @@ class GPT(nn.Module):
         cos, sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
         return cos[None, :, None, :], sin[None, :, None, :]
 
-    def _compute_window_sizes(self, config):
+    def _compute_window_sizes(self, config: GPTConfig) -> list[tuple[int, int]]:
         pattern = config.window_pattern.upper()
         long_w, short_w = config.sequence_len, config.sequence_len // 2
         char_to_w = {"L": (long_w, 0), "S": (short_w, 0)}
@@ -513,10 +556,10 @@ class GPT(nn.Module):
         sizes[-1] = (long_w, 0)  # final layer always full context
         return sizes
 
-    def get_device(self):
-        return self.transformer.wte.weight.device
+    def get_device(self) -> torch.device:
+        return self._token_embedding().weight.device
 
-    def _rms(self, tensors):
+    def _rms(self, tensors: list[Tensor]) -> Tensor | None:
         if not tensors:
             return None
         sq_sum = torch.zeros((), device=tensors[0].device, dtype=torch.float32)
@@ -526,10 +569,10 @@ class GPT(nn.Module):
             numel += p.numel()
         return (sq_sum / numel).sqrt()
 
-    def get_hira_rms(self):
+    def get_hira_rms(self) -> dict[str, Tensor | None]:
         adapters = [
             adapter
-            for block in self.transformer.h
+            for block in self._all_blocks()
             if block.attn_relax is not None
             for relax in (block.attn_relax, block.mlp_relax)
             for adapter in relax
@@ -545,11 +588,13 @@ class GPT(nn.Module):
             "hira/b2_rms": self._rms([a.B_2 for a in adapters]),
         }
 
-    def _compute_logits(self, x):
+    def _compute_logits(self, x: Tensor) -> Tensor:
         logits = self.lm_head(x)[..., : self.config.vocab_size].float()
         return 15 * torch.tanh(logits / 15)  # softcap
 
-    def _compute_loss(self, logits, targets, loss_reduction):
+    def _compute_loss(
+        self, logits: Tensor, targets: Tensor, loss_reduction: str
+    ) -> Tensor:
         ce = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
@@ -565,21 +610,32 @@ class GPT(nn.Module):
             return ce[valid].mean()
         raise ValueError(f"Unsupported loss_reduction={loss_reduction}")
 
-    def estimate_flops(self):
+    def estimate_flops(self) -> float:
         nparams = sum(p.numel() for p in self.parameters())
         hira_params = sum(
             p.numel()
-            for block in self.transformer.h
+            for block in self._all_blocks()
+            for relax in (block.attn_relax, block.mlp_relax)
+            if relax is not None
+            for p in relax.parameters()
+        )
+        shared_hira_params = sum(
+            p.numel()
+            for block in self._shared_blocks()
             for relax in (block.attn_relax, block.mlp_relax)
             if relax is not None
             for p in relax.parameters()
         )
         shared_params = (
-            sum(p.numel() for p in self.transformer.h.parameters())
-            - hira_params
-            + sum(p.numel() for p in self.ve_projs.parameters())
+            sum(p.numel() for block in self._shared_blocks() for p in block.parameters())
+            - shared_hira_params
+            + sum(
+                self.ve_projs[str(i)].weight.numel()
+                for i in range(1, self.config.n_layer)
+                if str(i) in self.ve_projs
+            )
         )
-        nparams_exclude = self.transformer.wte.weight.numel()
+        nparams_exclude = self._token_embedding().weight.numel()
         effective_params = (
             nparams - nparams_exclude + (self.num_iterations - 1) * shared_params
         )
@@ -588,30 +644,33 @@ class GPT(nn.Module):
             self.config.n_embd // self.config.n_head,
             self.config.sequence_len,
         )
-        attn_flops = self.num_iterations * sum(
-            12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t
-            for w in self.window_sizes
+        prelude_attn_flops = (
+            12 * h * q * min(self.window_sizes[0][0], t)
+            if self.window_sizes[0][0] >= 0
+            else 12 * h * q * t
         )
-        return 6 * effective_params + attn_flops
+        recurrent_attn_flops = self.num_iterations * sum(
+            12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t
+            for w in self.window_sizes[1:]
+        )
+        return 6 * effective_params + prelude_attn_flops + recurrent_attn_flops
 
-    def setup_optimizer(self, optimizer_name="muon"):
+    def setup_optimizer(self, optimizer_name: str = "muon") -> "DistMuonAdamW":
         ddp, rank, local_rank, world_size = get_dist_info()
         matrix_params = (
-            [p for block in self.transformer.h for p in block.attn.parameters()]
-            + [p for block in self.transformer.h for p in block.mlp.parameters()]
+            [p for block in self._all_blocks() for p in block.attn.parameters()]
+            + [p for block in self._all_blocks() for p in block.mlp.parameters()]
             + list(self.ve_projs.parameters())
             + list(self.iteration_mix_projs.parameters())
-            + list(self.iter_weight_mix_projs.parameters())
-            + list(self.iter_weight_heads.parameters())
         )
         hira_params = [
             p
-            for block in self.transformer.h
+            for block in self._all_blocks()
             for relax in (block.attn_relax, block.mlp_relax)
             if relax is not None
             for p in relax.parameters()
         ]
-        embed_params = list(self.transformer.wte.parameters())
+        embed_params = list(self._token_embedding().parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
@@ -709,42 +768,48 @@ class GPT(nn.Module):
 
     def forward(
         self,
-        idx,
-        targets=None,
-        loss_reduction="mean",
-    ):
+        idx: Tensor,
+        targets: Tensor | None = None,
+        loss_reduction: str = "mean",
+    ) -> Tensor:
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
-        x = norm(self.transformer.wte(idx))
+        x = norm(self._token_embedding()(idx))
+        x = self._run_block(self._prelude_block(), 0, x, x, cos_sin, 0)
         x0 = x
-        C = x.size(-1)
-        iteration_latents = x.new_empty(B, T, self.num_iterations, C)
-        iteration_weight_logits = x.new_empty(B, T, self.num_iterations)
+        use_aux_loss = targets is not None and self.training and self.num_iterations > 1
+        total_loss: Tensor | None = None
+        final_logits: Tensor | None = None
 
         for iteration in range(self.num_iterations):
             x = self.iteration_mix_projs[iteration](torch.cat([x, x0], dim=-1))
 
-            for i, block in enumerate(self.transformer.h):
-                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-                ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-                x = block(x, ve, cos_sin, self.window_sizes[i], iteration)
+            for i, block in enumerate(self._recurrent_blocks(), start=1):
+                x = self._run_block(block, i, x, x0, cos_sin, iteration)
 
-            iteration_latents[:, :, iteration, :] = x
-            mix = self.iter_weight_mix_projs[iteration](torch.cat([x, x0], dim=-1))
-            iteration_weight_logits[:, :, iteration] = self.iter_weight_heads[
-                iteration
-            ](new_gelu(mix)).squeeze(-1)
+            x = self._run_block(
+                self._post_block(),
+                self.config.n_layer - 1,
+                x,
+                x0,
+                cos_sin,
+                iteration,
+            )
 
-        iteration_weights = F.softmax(iteration_weight_logits.float(), dim=-1).to(
-            dtype=iteration_latents.dtype
-        )
-        x = (iteration_latents * iteration_weights.unsqueeze(-1)).sum(dim=-2)
-
-        logits = self._compute_logits(x)
+            if targets is not None and (use_aux_loss or iteration == self.num_iterations - 1):
+                final_logits = self._compute_logits(x)
+                if use_aux_loss:
+                    iter_loss = self._compute_loss(final_logits, targets, loss_reduction)
+                    total_loss = iter_loss if total_loss is None else total_loss + iter_loss
 
         if targets is not None:
-            return self._compute_loss(logits, targets, loss_reduction)
-        return logits
+            if use_aux_loss:
+                return total_loss / self.num_iterations
+            if final_logits is None:
+                final_logits = self._compute_logits(x)
+            return self._compute_loss(final_logits, targets, loss_reduction)
+
+        return self._compute_logits(x)
 
 
 # =============================================================================
@@ -1207,7 +1272,11 @@ model.init_weights()
 print0(f"HiRA parameter relaxation: {'enabled' if args.hira_rank > 0 else 'disabled'}")
 
 param_counts = sum(p.numel() for p in model.parameters())
-transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
+transformer_params = sum(
+    p.numel()
+    for block in model._all_blocks()
+    for p in block.parameters()
+)
 ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
 other_params = param_counts - transformer_params - ve_params - lm_head_params
