@@ -745,7 +745,7 @@ class GPT(nn.Module):
         x0 = x
 
         for iteration in range(self.num_iterations):
-            # IMPORTANT: Disabled ProjConcat x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
+            x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
             skip_connections = []
 
             for i, block in enumerate(self.transformer.h):
@@ -1334,19 +1334,12 @@ while current_epoch <= args.num_epochs:
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
-    warmdown_start = num_iterations - round(WARMDOWN_RATIO * num_iterations)
-    in_warmdown = WARMDOWN_RATIO > 0 and args.hira_rank > 0 and step > warmdown_start
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group.get("hira", False) and current_epoch == 1:
             group["lr"] = 0.0
         if group["kind"] == "muon":
             group["momentum"] = get_muon_momentum(step)
-    if in_warmdown:
-        for group in optimizer.param_groups:
-            if not group.get("hira", False):
-                for p in group["params"]:
-                    p.grad = None
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
