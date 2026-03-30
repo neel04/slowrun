@@ -449,6 +449,13 @@ class GPT(nn.Module):
         self.iter_norms = nn.ModuleList([
             RMSNorm(config.n_embd) for _ in range(self.num_iterations)
         ])
+        self.iter_weight_mix_projs = nn.ModuleList([
+            nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
+            for _ in range(self.num_iterations)
+        ])
+        self.iter_weight_heads = nn.ModuleList([
+            nn.Linear(config.n_embd, 1, bias=False) for _ in range(self.num_iterations)
+        ])
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -492,6 +499,10 @@ class GPT(nn.Module):
 
         for proj in self.skip_projs:
             torch.nn.init.uniform_(proj.weight, -s, s)
+        for proj in self.iter_weight_mix_projs:
+            torch.nn.init.uniform_(proj.weight, -s, s)
+        for head in self.iter_weight_heads:
+            torch.nn.init.zeros_(head.weight)
 
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
@@ -611,6 +622,8 @@ class GPT(nn.Module):
             + [p for block in self.transformer.h for p in block.mlp.parameters()]
             + list(self.ve_projs.parameters())
             + list(self.skip_projs.parameters())
+            + list(self.iter_weight_mix_projs.parameters())
+            + list(self.iter_weight_heads.parameters())
         )
         hira_params = [
             p
@@ -743,6 +756,9 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
+        C = x.size(-1)
+        iteration_latents = x.new_empty(B, T, self.num_iterations, C)
+        iteration_weight_logits = x.new_empty(B, T, self.num_iterations)
 
         for iteration in range(self.num_iterations):
             x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
@@ -762,6 +778,16 @@ class GPT(nn.Module):
 
             # Per-iteration learnable norm
             x = self.iter_norms[iteration](x)
+            iteration_latents[:, :, iteration, :] = x
+            mix = self.iter_weight_mix_projs[iteration](torch.cat([x, x0], dim=-1))
+            iteration_weight_logits[:, :, iteration] = self.iter_weight_heads[
+                iteration
+            ](new_gelu(mix)).squeeze(-1)
+
+        iteration_weights = F.softmax(iteration_weight_logits.float(), dim=-1).to(
+            dtype=iteration_latents.dtype
+        )
+        x = (iteration_latents * iteration_weights.unsqueeze(-1)).sum(dim=-2)
 
         logits = self._compute_logits(x)
 

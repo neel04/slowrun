@@ -20,7 +20,7 @@ except ImportError:
 
 SEARCH_SPACE = {
     "n_layer": [10, 15, 20],
-    "num_epochs": (1, 10),
+    "num_epochs": (1, 12),
     "hira_rank": [0, 16, 32, 64],
     "lr_multiplier": (0.05, 0.5),
     "warmup_ratio": (0.02, 0.5),
@@ -29,7 +29,6 @@ SEARCH_SPACE = {
 
 SEED_TRIALS = [
     {
-        "n_layer": 15,
         "num_epochs": 6,
         "hira_rank": 32,
         "lr_multiplier": 0.25,
@@ -196,7 +195,7 @@ def build_command(
     warmup_ratio = trial.suggest_float("warmup_ratio", *SEARCH_SPACE["warmup_ratio"])
 
     dropout = trial.suggest_float("dropout", 0.0, 0.5)
-    weight_decay = trial.suggest_float("weight_decay", 0.0, 2.0)
+    weight_decay = trial.suggest_float("weight_decay", 0.0, 4.0)
 
     total_batch_size = fixed_or_suggest(
         args.total_batch_size,
@@ -307,7 +306,8 @@ def main() -> None:
     )
 
     for params in SEED_TRIALS:
-        study.enqueue_trial(params, skip_if_exists=True)
+        trial_params = {"n_layer": args.n_layer, **params}
+        study.enqueue_trial(trial_params, skip_if_exists=True)
 
     wandb_callback = WeightsAndBiasesCallback(
         metric_name="best_val_loss",
