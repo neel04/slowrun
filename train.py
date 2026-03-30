@@ -437,12 +437,9 @@ class GPT(nn.Module):
             for i in range(config.n_layer)
             if has_ve(i, config.n_layer)
         })
-        # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
-        self.encoder_layers = config.n_layer // 2
-        self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         # ASURA: multiple iterations through the shared block stack.
         self.num_iterations = config.num_iterations
-        self.skip_projs = nn.ModuleList([
+        self.iteration_mix_projs = nn.ModuleList([
             nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
             for _ in range(self.num_iterations)
         ])
@@ -493,11 +490,10 @@ class GPT(nn.Module):
                 for adapter in block.mlp_relax:
                     adapter.reset_parameters()
 
-        self.skip_weights.fill_(1.0)
         for iter_norm in self.iter_norms:
             iter_norm.scale.fill_(1.0)
 
-        for proj in self.skip_projs:
+        for proj in self.iteration_mix_projs:
             torch.nn.init.uniform_(proj.weight, -s, s)
         for proj in self.iter_weight_mix_projs:
             torch.nn.init.uniform_(proj.weight, -s, s)
@@ -621,7 +617,7 @@ class GPT(nn.Module):
             [p for block in self.transformer.h for p in block.attn.parameters()]
             + [p for block in self.transformer.h for p in block.mlp.parameters()]
             + list(self.ve_projs.parameters())
-            + list(self.skip_projs.parameters())
+            + list(self.iteration_mix_projs.parameters())
             + list(self.iter_weight_mix_projs.parameters())
             + list(self.iter_weight_heads.parameters())
         )
@@ -636,7 +632,6 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        skip_params = [self.skip_weights]
         iter_norm_params = list(self.iter_norms.parameters())
 
         param_groups = [
@@ -669,14 +664,6 @@ class GPT(nn.Module):
                 params=x0_params,
                 lr=SCALAR_LR,
                 betas=(0.96, 0.95),
-                eps=1e-10,
-                weight_decay=0.0,
-            ),
-            dict(
-                kind="adamw",
-                params=skip_params,
-                lr=SCALAR_LR * 0.01,
-                betas=ADAM_BETAS,
                 eps=1e-10,
                 weight_decay=0.0,
             ),
@@ -761,20 +748,12 @@ class GPT(nn.Module):
         iteration_weight_logits = x.new_empty(B, T, self.num_iterations)
 
         for iteration in range(self.num_iterations):
-            x = self.skip_projs[iteration](torch.cat([x, x0], dim=-1))
-            skip_connections = []
+            x = self.iteration_mix_projs[iteration](torch.cat([x, x0], dim=-1))
 
             for i, block in enumerate(self.transformer.h):
-                if i >= self.encoder_layers and skip_connections:
-                    skip = skip_connections.pop()
-                    x = x + self.skip_weights[i - self.encoder_layers] * skip
-
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                 ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
                 x = block(x, ve, cos_sin, self.window_sizes[i], iteration)
-
-                if i < self.encoder_layers:
-                    skip_connections.append(x)
 
             # Per-iteration learnable norm
             x = self.iter_norms[iteration](x)
