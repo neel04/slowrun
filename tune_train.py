@@ -18,28 +18,75 @@ except ImportError:
     from optuna_integration.wandb import WeightsAndBiasesCallback
 
 
-SEARCH_SPACE = {
+COMMON_SEARCH_SPACE = {
     "n_layer": [10, 15, 20],
     "num_epochs": (1, 12),
     "hira_rank": [0, 16, 32, 64],
-    "lr_multiplier": (0.05, 0.5),
-    "warmup_ratio": (0.02, 0.5),
-    "total_batch_size": [131072, 262144, 524288],
 }
 
-SEED_TRIALS = [
-    {
-        "num_epochs": 6,
-        "hira_rank": 32,
-        "lr_multiplier": 0.25,
-        "warmup_ratio": 0.02,
-        "dropout": 0.05,
-        "weight_decay": 1.0,
-        "total_batch_size": 524288,
+OPTIMIZER_SEARCH_SPACE = {
+    "muon": {
+        "lr_multiplier": (0.05, 0.5),
+        "warmup_ratio": (0.02, 0.5),
+        "dropout": (0.0, 0.5),
+        "weight_decay": (0.0, 4.0),
+        "weight_decay_log": False,
+        "total_batch_size": [131072, 262144, 524288],
     },
-]
+    "adamw": {
+        "lr_multiplier": (0.002, 0.04),
+        "warmup_ratio": (0.02, 0.12),
+        "dropout": (0.0, 0.2),
+        "weight_decay": (0.003, 0.2),
+        "weight_decay_log": True,
+        "adam_beta1": [0.8, 0.85, 0.9, 0.95, 0.99],
+        "adam_beta2": [0.95, 0.98, 0.99, 0.995, 0.999],
+        "total_batch_size": [65536, 131072, 262144, 524288],
+    },
+}
 
-TPE_STARTUP_TRIALS = 8
+SEED_TRIALS = {
+    "muon": [
+        {
+            "num_epochs": 6,
+            "hira_rank": 32,
+            "lr_multiplier": 0.25,
+            "warmup_ratio": 0.02,
+            "dropout": 0.05,
+            "weight_decay": 1.0,
+            "total_batch_size": 524288,
+        },
+    ],
+    "adamw": [
+        {
+            "num_epochs": 6,
+            "hira_rank": 0,
+            "lr_multiplier": 0.004,
+            "warmup_ratio": 0.04,
+            "dropout": 0.05,
+            "weight_decay": 0.05,
+            "adam_beta1": 0.8,
+            "adam_beta2": 0.95,
+            "total_batch_size": 262144,
+        },
+        {
+            "num_epochs": 6,
+            "hira_rank": 16,
+            "lr_multiplier": 0.008,
+            "warmup_ratio": 0.06,
+            "dropout": 0.1,
+            "weight_decay": 0.1,
+            "adam_beta1": 0.9,
+            "adam_beta2": 0.99,
+            "total_batch_size": 131072,
+        },
+    ],
+}
+
+TRAIN_DEFAULT_DEVICE_BATCH_SIZE = 4
+TRAIN_SEQUENCE_LEN = 2048
+TRAIN_NPROC_PER_NODE = 8
+TPE_STARTUP_TRIALS = 12
 PRUNE_PERCENTILE = 50.0
 EPOCH_VAL_LOSS_RE = re.compile(
     r"Step\s+\d+\s+\|\s+Epoch\s+(\d+)\s+\|\s+Val BPB:\s+[0-9.eE+-]+\s+\|\s+Val Loss:\s+([0-9.eE+-]+)"
@@ -127,6 +174,93 @@ def get_fixed_overrides(args: argparse.Namespace) -> dict[str, object]:
     return overrides
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    if args.n_layer is not None and args.n_layer < 3:
+        raise ValueError("--n_layer must be at least 3")
+    train_script = Path(args.train_script)
+    if not train_script.is_absolute():
+        train_script = Path(__file__).resolve().parent / train_script
+    if not train_script.exists():
+        raise FileNotFoundError(f"train script not found: {train_script}")
+
+
+def effective_device_batch_size(args: argparse.Namespace) -> int:
+    return (
+        args.device_batch_size
+        if args.device_batch_size is not None
+        else TRAIN_DEFAULT_DEVICE_BATCH_SIZE
+    )
+
+
+def tokens_per_fwdbwd(args: argparse.Namespace) -> int:
+    return effective_device_batch_size(args) * TRAIN_SEQUENCE_LEN * TRAIN_NPROC_PER_NODE
+
+
+def valid_total_batch_sizes(args: argparse.Namespace, optimizer: str) -> list[int]:
+    tok_per_step = tokens_per_fwdbwd(args)
+    return [
+        bs
+        for bs in OPTIMIZER_SEARCH_SPACE[optimizer]["total_batch_size"]
+        if bs % tok_per_step == 0
+    ]
+
+
+def param_name(
+    args: argparse.Namespace, optimizer: str, raw_name: str, *, common: bool = False
+) -> str:
+    if common or args.optimizer != "search":
+        return raw_name
+    return f"{optimizer}_{raw_name}"
+
+
+def describe_search_space(args: argparse.Namespace) -> dict[str, object]:
+    if args.optimizer == "search":
+        search_space = {
+            "common": dict(COMMON_SEARCH_SPACE),
+            "by_optimizer": {
+                optimizer: dict(space)
+                for optimizer, space in OPTIMIZER_SEARCH_SPACE.items()
+            },
+        }
+        for optimizer in OPTIMIZER_SEARCH_SPACE:
+            search_space["by_optimizer"][optimizer] = {
+                **search_space["by_optimizer"][optimizer],
+                "valid_total_batch_size": valid_total_batch_sizes(args, optimizer),
+            }
+        return search_space
+    return {
+        **COMMON_SEARCH_SPACE,
+        **OPTIMIZER_SEARCH_SPACE[args.optimizer],
+        "valid_total_batch_size": valid_total_batch_sizes(args, args.optimizer),
+    }
+
+
+def enqueue_seed_trials(
+    study: optuna.Study, args: argparse.Namespace
+) -> None:
+    optimizers = ["muon", "adamw"] if args.optimizer == "search" else [args.optimizer]
+    for optimizer in optimizers:
+        valid_batch_sizes = set(valid_total_batch_sizes(args, optimizer))
+        for params in SEED_TRIALS[optimizer]:
+            if (
+                args.total_batch_size is None
+                and params["total_batch_size"] not in valid_batch_sizes
+            ):
+                continue
+            trial_params = {}
+            for key, value in params.items():
+                trial_params[param_name(args, optimizer, key)] = value
+            if args.optimizer == "search":
+                trial_params["optimizer"] = optimizer
+            if args.n_layer is not None:
+                trial_params["n_layer"] = args.n_layer
+            if args.total_batch_size is not None:
+                trial_params[param_name(args, optimizer, "total_batch_size")] = (
+                    args.total_batch_size
+                )
+            study.enqueue_trial(trial_params, skip_if_exists=True)
+
+
 def stream_subprocess(
     cmd: list[str],
     env: dict[str, str],
@@ -180,27 +314,51 @@ def build_command(
         if args.optimizer == "search"
         else args.optimizer
     )
+    optimizer_space = OPTIMIZER_SEARCH_SPACE[optimizer]
 
     n_layer = fixed_or_suggest(
         args.n_layer,
-        lambda: trial.suggest_categorical("n_layer", SEARCH_SPACE["n_layer"]),
+        lambda: trial.suggest_categorical("n_layer", COMMON_SEARCH_SPACE["n_layer"]),
     )
 
-    num_epochs = trial.suggest_int("num_epochs", *SEARCH_SPACE["num_epochs"])
-    hira_rank = trial.suggest_categorical("hira_rank", SEARCH_SPACE["hira_rank"])
+    num_epochs = trial.suggest_int("num_epochs", *COMMON_SEARCH_SPACE["num_epochs"])
+    hira_rank = trial.suggest_categorical("hira_rank", COMMON_SEARCH_SPACE["hira_rank"])
     lr_multiplier = trial.suggest_float(
-        "lr_multiplier", *SEARCH_SPACE["lr_multiplier"], log=True
+        param_name(args, optimizer, "lr_multiplier"),
+        *optimizer_space["lr_multiplier"],
+        log=True,
     )
 
-    warmup_ratio = trial.suggest_float("warmup_ratio", *SEARCH_SPACE["warmup_ratio"])
+    warmup_ratio = trial.suggest_float(
+        param_name(args, optimizer, "warmup_ratio"),
+        *optimizer_space["warmup_ratio"],
+    )
 
-    dropout = trial.suggest_float("dropout", 0.0, 0.5)
-    weight_decay = trial.suggest_float("weight_decay", 0.0, 4.0)
+    dropout = trial.suggest_float(
+        param_name(args, optimizer, "dropout"), *optimizer_space["dropout"]
+    )
+    weight_decay = trial.suggest_float(
+        param_name(args, optimizer, "weight_decay"),
+        *optimizer_space["weight_decay"],
+        log=optimizer_space["weight_decay_log"],
+    )
+    adam_beta1 = None
+    adam_beta2 = None
+    if optimizer == "adamw":
+        adam_beta1 = trial.suggest_categorical(
+            param_name(args, optimizer, "adam_beta1"),
+            optimizer_space["adam_beta1"],
+        )
+        adam_beta2 = trial.suggest_categorical(
+            param_name(args, optimizer, "adam_beta2"),
+            optimizer_space["adam_beta2"],
+        )
 
     total_batch_size = fixed_or_suggest(
         args.total_batch_size,
         lambda: trial.suggest_categorical(
-            "total_batch_size", SEARCH_SPACE["total_batch_size"]
+            param_name(args, optimizer, "total_batch_size"),
+            valid_total_batch_sizes(args, optimizer),
         ),
     )
 
@@ -234,6 +392,8 @@ def build_command(
         "--save-result",
         str(result_path),
     ]
+    if adam_beta1 is not None and adam_beta2 is not None:
+        cmd.extend(["--adam-beta1", str(adam_beta1), "--adam-beta2", str(adam_beta2)])
     if args.input_bin:
         cmd.extend(["--input_bin", args.input_bin])
     if args.input_val_bin:
@@ -246,8 +406,23 @@ def build_command(
 
 def main() -> None:
     args, passthrough = parse_args()
+    validate_args(args)
     fixed_overrides = get_fixed_overrides(args)
     storage = args.storage or f"sqlite:///{Path('/tmp') / f'{args.study_name}.db'}"
+
+    if args.total_batch_size is not None and args.total_batch_size % tokens_per_fwdbwd(args) != 0:
+        raise ValueError(
+            "--total_batch_size must be divisible by "
+            f"device_batch_size * {TRAIN_SEQUENCE_LEN} * {TRAIN_NPROC_PER_NODE}"
+        )
+    if args.total_batch_size is None:
+        optimizers = ["muon", "adamw"] if args.optimizer == "search" else [args.optimizer]
+        for optimizer in optimizers:
+            if not valid_total_batch_sizes(args, optimizer):
+                raise ValueError(
+                    f"No valid total_batch_size choices remain for optimizer={optimizer} "
+                    f"with device_batch_size={effective_device_batch_size(args)}"
+                )
 
     wandb_group = (
         args.wandb_group
@@ -268,7 +443,7 @@ def main() -> None:
                 "error_log": args.error_log,
                 "tpe_startup_trials": TPE_STARTUP_TRIALS,
                 "prune_percentile": PRUNE_PERCENTILE,
-                "search_space": SEARCH_SPACE,
+                "search_space": describe_search_space(args),
             },
             indent=2,
         )
@@ -293,7 +468,7 @@ def main() -> None:
     pruner = optuna.pruners.PercentilePruner(
         percentile=PRUNE_PERCENTILE,
         n_startup_trials=TPE_STARTUP_TRIALS,
-        n_warmup_steps=1,
+        n_warmup_steps=2,
         interval_steps=1,
     )
     study = optuna.create_study(
@@ -305,9 +480,7 @@ def main() -> None:
         pruner=pruner,
     )
 
-    for params in SEED_TRIALS:
-        trial_params = {"n_layer": args.n_layer, **params}
-        study.enqueue_trial(trial_params, skip_if_exists=True)
+    enqueue_seed_trials(study, args)
 
     wandb_callback = WeightsAndBiasesCallback(
         metric_name="best_val_loss",

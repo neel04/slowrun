@@ -57,6 +57,8 @@ parser.add_argument("--optimizer", type=str, choices=("muon", "adamw"), default=
 parser.add_argument("--hira-rank", type=int, default=32)
 parser.add_argument("--train-fraction", type=float, default=1.0)
 parser.add_argument("--warmup-ratio", type=float, default=0.02)
+parser.add_argument("--adam-beta1", type=float, default=0.8)
+parser.add_argument("--adam-beta2", type=float, default=0.95)
 args = parser.parse_args()
 
 # Resolve output path
@@ -93,7 +95,7 @@ EMBEDDING_LR = BASE_EMBEDDING_LR * _lr_mult
 SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 
 WEIGHT_DECAY = args.weight_decay
-ADAM_BETAS = (0.8, 0.95)
+ADAM_BETAS = (args.adam_beta1, args.adam_beta2)
 WARMUP_RATIO = args.warmup_ratio
 WARMDOWN_RATIO = 0.25
 FINAL_LR_FRAC = 0.0
@@ -476,19 +478,6 @@ class GPT(nn.Module):
     def _post_block(self) -> Block:
         return cast(Block, self.transformer["post"])
 
-    def _run_block(
-        self,
-        block: Block,
-        layer_idx: int,
-        x: Tensor,
-        anchor: Tensor,
-        cos_sin: tuple[Tensor, Tensor],
-        iteration_idx: int,
-    ) -> Tensor:
-        x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * anchor
-        ve = self.ve_projs[str(layer_idx)](anchor) if str(layer_idx) in self.ve_projs else None
-        return block(x, ve, cos_sin, self.window_sizes[layer_idx], iteration_idx)
-
     @torch.no_grad()
     def init_weights(self) -> None:
         torch.nn.init.normal_(self._token_embedding().weight, mean=0.0, std=1.0)
@@ -775,8 +764,19 @@ class GPT(nn.Module):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self._token_embedding()(idx))
-        x = self._run_block(self._prelude_block(), 0, x, x, cos_sin, 0)
+        prelude_anchor = x
+        prelude_ve = self.ve_projs["0"](prelude_anchor) if "0" in self.ve_projs else None
+        x = self.resid_lambdas[0] * x + self.x0_lambdas[0] * prelude_anchor
+        x = self._prelude_block()(x, prelude_ve, cos_sin, self.window_sizes[0], 0)
         x0 = x
+        shared_blocks = tuple(self._shared_blocks())
+        shared_resid_lambdas = self.resid_lambdas[1:]
+        shared_x0_lambdas = self.x0_lambdas[1:]
+        shared_window_sizes = self.window_sizes[1:]
+        shared_ves = tuple(
+            self.ve_projs[str(layer_idx)](x0) if str(layer_idx) in self.ve_projs else None
+            for layer_idx in range(1, self.config.n_layer)
+        )
         use_aux_loss = targets is not None and self.training and self.num_iterations > 1
         total_loss: Tensor | None = None
         final_logits: Tensor | None = None
@@ -784,17 +784,15 @@ class GPT(nn.Module):
         for iteration in range(self.num_iterations):
             x = self.iteration_mix_projs[iteration](torch.cat([x, x0], dim=-1))
 
-            for i, block in enumerate(self._recurrent_blocks(), start=1):
-                x = self._run_block(block, i, x, x0, cos_sin, iteration)
-
-            x = self._run_block(
-                self._post_block(),
-                self.config.n_layer - 1,
-                x,
-                x0,
-                cos_sin,
-                iteration,
-            )
+            for resid_lambda, x0_lambda, block, ve, window_size in zip(
+                shared_resid_lambdas,
+                shared_x0_lambdas,
+                shared_blocks,
+                shared_ves,
+                shared_window_sizes,
+            ):
+                x = resid_lambda * x + x0_lambda * x0
+                x = block(x, ve, cos_sin, window_size, iteration)
 
             if targets is not None and (use_aux_loss or iteration == self.num_iterations - 1):
                 final_logits = self._compute_logits(x)
@@ -1486,6 +1484,8 @@ if args.save_result and master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
+        "adam_beta1": args.adam_beta1,
+        "adam_beta2": args.adam_beta2,
         "num_epochs": args.num_epochs,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
