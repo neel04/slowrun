@@ -26,6 +26,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import wandb
 import tiktoken
+from datasets import load_dataset
 from torch import Tensor
 
 _script_start = time.time()
@@ -59,6 +60,11 @@ parser.add_argument("--train-fraction", type=float, default=1.0)
 parser.add_argument("--warmup-ratio", type=float, default=0.02)
 parser.add_argument("--adam-beta1", type=float, default=0.8)
 parser.add_argument("--adam-beta2", type=float, default=0.95)
+parser.add_argument(
+    "--downstream-eval-tasks", type=str, default="piqa,lambada_openai"
+)
+parser.add_argument("--downstream-eval-limit", type=int, default=0)
+parser.add_argument("--downstream-eval-batch-size", type=int, default=4)
 args = parser.parse_args()
 
 # Resolve output path
@@ -125,6 +131,9 @@ class DummyWandb:
         self.summary = {}
 
     def log(self, *a, **kw):
+        pass
+
+    def log_code(self, root="."):
         pass
 
     def finish(self):
@@ -1136,6 +1145,296 @@ class DataLoader:
 # =============================================================================
 
 
+@dataclass(frozen=True)
+class ScoringSequence:
+    x_tokens: list[int]
+    y_tokens: list[int]
+
+
+def parse_downstream_eval_tasks(raw_tasks: str) -> tuple[str, ...]:
+    tasks = tuple(task.strip().lower() for task in raw_tasks.split(",") if task.strip())
+    supported_tasks = {"piqa", "lambada_openai"}
+    invalid_tasks = sorted(set(tasks) - supported_tasks)
+    if invalid_tasks:
+        raise ValueError(
+            f"Unsupported downstream eval tasks: {invalid_tasks}. "
+            f"Supported tasks: {sorted(supported_tasks)}"
+        )
+    return tasks
+
+
+def get_eval_autocast_context(device_type: str):
+    if device_type == "cuda":
+        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def build_scoring_sequence(
+    encoder: tiktoken.Encoding,
+    prompt: str,
+    continuation: str,
+    max_seq_len: int,
+) -> ScoringSequence | None:
+    prompt_tokens = encoder.encode_ordinary(prompt)
+    continuation_tokens = encoder.encode_ordinary(continuation)
+    if not prompt_tokens or not continuation_tokens:
+        return None
+    overflow = len(prompt_tokens) + len(continuation_tokens) - (max_seq_len + 1)
+    if overflow > 0:
+        if overflow >= len(prompt_tokens):
+            return None
+        prompt_tokens = prompt_tokens[overflow:]
+    tokens = prompt_tokens + continuation_tokens
+    x_tokens = tokens[:-1]
+    y_tokens = tokens[1:]
+    ignore_prefix = len(prompt_tokens) - 1
+    for i in range(ignore_prefix):
+        y_tokens[i] = -1
+    return ScoringSequence(x_tokens=x_tokens, y_tokens=y_tokens)
+
+
+_downstream_dataset_cache: dict[str, list[dict[str, object]]] = {}
+_downstream_dataset_sources: dict[str, str] = {}
+
+
+def load_downstream_records(task_name: str, limit: int) -> list[dict[str, object]]:
+    cached = _downstream_dataset_cache.get(task_name)
+    if cached is not None:
+        return cached[:limit] if limit > 0 else cached
+
+    candidates: dict[str, list[tuple[str, str | None, str]]] = {
+        "piqa": [("lighteval/piqa", None, "validation")],
+        "lambada_openai": [("EleutherAI/lambada_openai", "default", "test")],
+    }
+    errors: list[str] = []
+    for path, config_name, split in candidates[task_name]:
+        try:
+            if config_name is None:
+                dataset = load_dataset(path, split=split)
+            else:
+                dataset = load_dataset(path, config_name, split=split)
+            records = [cast(dict[str, object], dataset[i]) for i in range(len(dataset))]
+            _downstream_dataset_cache[task_name] = records
+            _downstream_dataset_sources[task_name] = (
+                f"{path}/{config_name or '-'}:{split}"
+            )
+            return records[:limit] if limit > 0 else records
+        except Exception as exc:
+            errors.append(f"{path}/{config_name or '-'}:{split} -> {exc}")
+    raise RuntimeError(
+        f"Unable to load downstream dataset {task_name}. Tried: {'; '.join(errors)}"
+    )
+
+
+@torch.no_grad()
+def score_sequences(
+    model: GPT,
+    sequences: list[ScoringSequence],
+    *,
+    batch_size: int,
+    pad_token_id: int,
+    device_type: str,
+) -> tuple[list[float], list[bool]]:
+    scores: list[float] = []
+    exact_matches: list[bool] = []
+    model_device = model.get_device()
+    for start in range(0, len(sequences), batch_size):
+        batch = sequences[start : start + batch_size]
+        max_len = max(len(sequence.x_tokens) for sequence in batch)
+        x = torch.full(
+            (len(batch), max_len), pad_token_id, dtype=torch.long, device=model_device
+        )
+        y = torch.full((len(batch), max_len), -1, dtype=torch.long, device=model_device)
+        for row, sequence in enumerate(batch):
+            x[row, : len(sequence.x_tokens)] = torch.tensor(
+                sequence.x_tokens, dtype=torch.long, device=model_device
+            )
+            y[row, : len(sequence.y_tokens)] = torch.tensor(
+                sequence.y_tokens, dtype=torch.long, device=model_device
+            )
+        with get_eval_autocast_context(device_type):
+            logits = model(x)
+        mask = y != -1
+        safe_y = y.masked_fill(~mask, 0)
+        token_logprobs = F.log_softmax(logits, dim=-1).gather(
+            -1, safe_y.unsqueeze(-1)
+        ).squeeze(-1)
+        batch_scores = token_logprobs.masked_fill(~mask, 0.0).sum(dim=-1)
+        greedy = logits.argmax(dim=-1)
+        batch_exact = ((greedy == safe_y) | ~mask).all(dim=-1)
+        scores.extend(batch_scores.float().cpu().tolist())
+        exact_matches.extend(batch_exact.cpu().tolist())
+    return scores, exact_matches
+
+
+def evaluate_piqa(
+    model: GPT,
+    encoder: tiktoken.Encoding,
+    *,
+    limit: int,
+    batch_size: int,
+    max_seq_len: int,
+    pad_token_id: int,
+    device_type: str,
+) -> dict[str, float]:
+    records = load_downstream_records("piqa", limit)
+    sequences: list[ScoringSequence] = []
+    continuation_token_counts: list[int] = []
+    labels: list[int] = []
+    skipped = 0
+    for record in records:
+        prompt = f"Question: {cast(str, record['goal'])}\nAnswer:"
+        seq1 = build_scoring_sequence(
+            encoder, prompt, f" {cast(str, record['sol1'])}", max_seq_len
+        )
+        seq2 = build_scoring_sequence(
+            encoder, prompt, f" {cast(str, record['sol2'])}", max_seq_len
+        )
+        if seq1 is None or seq2 is None:
+            skipped += 1
+            continue
+        sequences.extend([seq1, seq2])
+        continuation_token_counts.extend(
+            [
+                sum(token != -1 for token in seq1.y_tokens),
+                sum(token != -1 for token in seq2.y_tokens),
+            ]
+        )
+        labels.append(int(record["label"]))
+    if not labels:
+        raise RuntimeError("PIQA evaluation had no valid examples")
+    scores, _ = score_sequences(
+        model,
+        sequences,
+        batch_size=batch_size,
+        pad_token_id=pad_token_id,
+        device_type=device_type,
+    )
+    correct = 0
+    correct_norm = 0
+    for example_idx, label in enumerate(labels):
+        score1 = scores[2 * example_idx]
+        score2 = scores[2 * example_idx + 1]
+        score1_norm = score1 / continuation_token_counts[2 * example_idx]
+        score2_norm = score2 / continuation_token_counts[2 * example_idx + 1]
+        pred = 0 if score1 >= score2 else 1
+        pred_norm = 0 if score1_norm >= score2_norm else 1
+        correct += int(pred == label)
+        correct_norm += int(pred_norm == label)
+    total = len(labels)
+    return {
+        "downstream/piqa_acc": correct / total,
+        "downstream/piqa_acc_norm": correct_norm / total,
+        "downstream/piqa_examples": float(total),
+        "downstream/piqa_skipped": float(skipped),
+    }
+
+
+def split_lambada_prompt_and_target(text: str) -> tuple[str, str] | None:
+    stripped = text.rstrip()
+    split_idx = stripped.rfind(" ")
+    if split_idx <= 0:
+        return None
+    return stripped[:split_idx], stripped[split_idx:]
+
+
+def evaluate_lambada_openai(
+    model: GPT,
+    encoder: tiktoken.Encoding,
+    *,
+    limit: int,
+    batch_size: int,
+    max_seq_len: int,
+    pad_token_id: int,
+    device_type: str,
+) -> dict[str, float]:
+    records = load_downstream_records("lambada_openai", limit)
+    sequences: list[ScoringSequence] = []
+    continuation_token_counts: list[int] = []
+    skipped = 0
+    for record in records:
+        text = record.get("text") or record.get("sentence")
+        if not isinstance(text, str):
+            skipped += 1
+            continue
+        prompt_and_target = split_lambada_prompt_and_target(text)
+        if prompt_and_target is None:
+            skipped += 1
+            continue
+        prompt, continuation = prompt_and_target
+        sequence = build_scoring_sequence(encoder, prompt, continuation, max_seq_len)
+        if sequence is None:
+            skipped += 1
+            continue
+        sequences.append(sequence)
+        continuation_token_counts.append(sum(token != -1 for token in sequence.y_tokens))
+    if not sequences:
+        raise RuntimeError("LAMBADA OpenAI evaluation had no valid examples")
+    scores, exact_matches = score_sequences(
+        model,
+        sequences,
+        batch_size=batch_size,
+        pad_token_id=pad_token_id,
+        device_type=device_type,
+    )
+    total_examples = len(sequences)
+    total_tokens = sum(continuation_token_counts)
+    total_nll = -sum(scores)
+    return {
+        "downstream/lambada_openai_acc": sum(exact_matches) / total_examples,
+        "downstream/lambada_openai_loss": total_nll / total_tokens,
+        "downstream/lambada_openai_perplexity": math.exp(total_nll / total_tokens),
+        "downstream/lambada_openai_word_perplexity": math.exp(
+            total_nll / total_examples
+        ),
+        "downstream/lambada_openai_examples": float(total_examples),
+        "downstream/lambada_openai_skipped": float(skipped),
+    }
+
+
+def evaluate_downstream(
+    model: GPT,
+    encoder: tiktoken.Encoding,
+    *,
+    tasks: tuple[str, ...],
+    limit: int,
+    batch_size: int,
+    max_seq_len: int,
+    pad_token_id: int,
+    device_type: str,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for task in tasks:
+        try:
+            if task == "piqa":
+                metrics.update(
+                    evaluate_piqa(
+                        model,
+                        encoder,
+                        limit=limit,
+                        batch_size=batch_size,
+                        max_seq_len=max_seq_len,
+                        pad_token_id=pad_token_id,
+                        device_type=device_type,
+                    )
+                )
+            elif task == "lambada_openai":
+                metrics.update(
+                    evaluate_lambada_openai(
+                        model,
+                        encoder,
+                        limit=limit,
+                        batch_size=batch_size,
+                        max_seq_len=max_seq_len,
+                        pad_token_id=pad_token_id,
+                        device_type=device_type,
+                    )
+                )
+        except Exception as exc:
+            print0(f"Downstream eval skipped for {task}: {exc}")
+    return metrics
+
+
 @torch.no_grad()
 def evaluate_bpb(model, batches, steps, token_bytes):
     """Compute bits per byte and mean cross-entropy loss on a set of batches."""
@@ -1247,6 +1546,15 @@ print0("-----------------------")
 encoder = tiktoken.get_encoding("gpt2")
 vocab_size = encoder.n_vocab  # 50257
 print0(f"Vocab size: {vocab_size:,}")
+downstream_eval_tasks = parse_downstream_eval_tasks(args.downstream_eval_tasks)
+if args.downstream_eval_limit < 0:
+    raise ValueError("--downstream-eval-limit must be >= 0")
+if args.downstream_eval_batch_size <= 0:
+    raise ValueError("--downstream-eval-batch-size must be >= 1")
+print0(
+    "Downstream evals: "
+    + (", ".join(downstream_eval_tasks) if downstream_eval_tasks else "disabled")
+)
 
 eot_id = encoder._special_tokens["<|endoftext|>"]
 token_bytes_list = []
@@ -1315,6 +1623,7 @@ build_val_loader = lambda: DataLoader(
 )
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
+current_epoch = int(current_epoch)
 
 # Training config
 tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
@@ -1355,12 +1664,67 @@ smooth_train_loss = 0
 total_training_time = 0
 eval_steps = val_loader.num_steps
 
+
+def run_and_log_downstream_eval(step: int, epoch: int | None = None) -> None:
+    if not downstream_eval_tasks:
+        return
+    if master_process:
+        t0 = time.time()
+        try:
+            metrics = evaluate_downstream(
+                orig_model,
+                encoder,
+                tasks=downstream_eval_tasks,
+                limit=args.downstream_eval_limit,
+                batch_size=args.downstream_eval_batch_size,
+                max_seq_len=MAX_SEQ_LEN,
+                pad_token_id=eot_id,
+                device_type=device_type,
+            )
+            if not metrics:
+                print0("Downstream eval skipped: no downstream tasks completed successfully")
+                return
+            metrics["downstream/runtime_sec"] = time.time() - t0
+            metric_str = " | ".join(
+                f"{name.split('/', 1)[1]}: {value:.4f}"
+                for name, value in metrics.items()
+            )
+            source_labels = [
+                f"{task}_source: {_downstream_dataset_sources[task]}"
+                for task in downstream_eval_tasks
+                if any(metric_name.startswith(f"downstream/{task}_") for metric_name in metrics)
+                and task in _downstream_dataset_sources
+            ]
+            if source_labels:
+                metric_str = f"{metric_str} | " + " | ".join(source_labels)
+            prefix = f"Step {step:05d}"
+            if epoch is not None:
+                prefix += f" | Epoch {epoch}"
+            print0(f"{prefix} | Downstream | {metric_str}")
+            wandb_payload = {"step": step, **metrics}
+            if epoch is not None:
+                wandb_payload["epoch"] = epoch
+            wandb_run.log(wandb_payload)
+            for task in downstream_eval_tasks:
+                if task in _downstream_dataset_sources:
+                    wandb_run.summary[f"downstream/{task}_source"] = (
+                        _downstream_dataset_sources[task]
+                    )
+            for key, value in metrics.items():
+                wandb_run.summary[key] = value
+        except Exception as exc:
+            print0(f"Downstream eval skipped: {exc}")
+    if dist.is_initialized():
+        dist.barrier()
+    return
+
 # Initial val evaluation
 model.eval()
 with autocast_ctx:
     val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
 print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
 wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+run_and_log_downstream_eval(step)
 min_val_bpb = val_bpb
 min_val_loss = val_loss
 model.train()
@@ -1375,6 +1739,7 @@ while current_epoch <= args.num_epochs:
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
+        epoch = int(epoch)
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
@@ -1430,7 +1795,7 @@ while current_epoch <= args.num_epochs:
     if ddp:
         epoch_tensor = torch.tensor([epoch], dtype=torch.long, device=device)
         dist.all_reduce(epoch_tensor, op=dist.ReduceOp.MAX)
-        epoch = epoch_tensor.item()
+        epoch = int(epoch_tensor.item())
 
     # Epoch boundary: evaluate when the dataloader advances to a new epoch
     if epoch != current_epoch:
@@ -1447,6 +1812,7 @@ while current_epoch <= args.num_epochs:
             "val/bpb": val_bpb,
             "val/loss": val_loss,
         })
+        run_and_log_downstream_eval(step, current_epoch)
         # Early stopping
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
