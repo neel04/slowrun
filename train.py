@@ -11,6 +11,7 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import gc
+import importlib
 import json
 import math
 import time
@@ -112,6 +113,9 @@ if args.output_json and not args.save_result:
 # Hardwired d12 (GPT-2 small) hyperparameters
 # =============================================================================
 
+# RLM
+NUM_ITERATIONS = 3
+
 # Architecture (defaults = d12 GPT-2 small)
 DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
@@ -191,16 +195,30 @@ def load_state_dict_into_model(model, state_dict):
 def _load_fa3():
     if not torch.cuda.is_available():
         return None
+    errors = []
     try:
         major, _ = torch.cuda.get_device_capability()
         if major != 9:
             return None
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    except Exception as exc:
+        errors.append(f"cuda capability check failed: {exc}")
+        return None
+
+    try:
+        return importlib.import_module("flash_attn_interface")
+    except Exception as exc:
+        errors.append(f"import flash_attn_interface failed: {exc}")
+
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    try:
         from kernels import get_kernel
 
         return get_kernel("varunneal/flash-attention-3").flash_attn_interface
-    except Exception:
-        return None
+    except Exception as exc:
+        errors.append(f"kernels.get_kernel('varunneal/flash-attention-3') failed: {exc}")
+
+    _load_fa3.last_error = " | ".join(errors)
+    return None
 
 
 _fa3 = _load_fa3()
@@ -420,14 +438,10 @@ class GPT(nn.Module):
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
     def estimate_flops(self):
-        nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embedding lookup + elementwise scalars
-        nparams_exclude = (
-            self.transformer.wte.weight.numel()
-            + self.resid_lambdas.numel()
-            + self.x0_lambdas.numel()
-            + self.skip_weights.numel()
+        recurrent_params = sum(p.numel() for p in self.transformer.h.parameters()) + sum(
+            p.numel() for p in self.ve_projs.parameters()
         )
+        lm_head_params = self.lm_head.weight.numel()
         h, q, t = (
             self.config.n_head,
             self.config.n_embd // self.config.n_head,
@@ -438,7 +452,9 @@ class GPT(nn.Module):
             12 * h * q * self._avg_causal_attended_keys(w[0], t)
             for w in self.window_sizes
         )
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        return 6 * (lm_head_params + NUM_ITERATIONS * recurrent_params) + (
+            NUM_ITERATIONS * attn_flops
+        )
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -521,9 +537,8 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
+    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, cos_sin):
         """Run decoder layers [start, end), with U-Net skip connections."""
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
@@ -534,28 +549,33 @@ class GPT(nn.Module):
             x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
         return x
 
-    def forward(self, idx, targets=None, loss_reduction="mean"):
-        B, T = idx.size()
-        x = norm(self.transformer.wte(idx))
+    def _run_network_once(self, x, cos_sin):
         x0 = x
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
-
-        # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
+
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
             x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
             encoder_outputs.append(x)
 
-        # Decoder half
-        x = self._run_decoder_layers(
-            x, x0, encoder_outputs, self.encoder_layers, self.config.n_layer, T
+        return self._run_decoder_layers(
+            x, x0, encoder_outputs, self.encoder_layers, self.config.n_layer, cos_sin
         )
 
-        x = norm(x)
+    def forward(self, idx, targets=None, loss_reduction="mean"):
+        _, T = idx.size()
+
+        x = norm(self.transformer.wte(idx))
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+
+        for _ in range(NUM_ITERATIONS):
+            x = self._run_network_once(x, cos_sin)
+            x = norm(x)
+
         logits = self.lm_head(x)[..., : self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
+
         if targets is not None:
             return F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
@@ -1025,7 +1045,10 @@ if _fa3 is not None:
     print0("Using Flash Attention 3 (Hopper GPU detected)")
 else:
     raise RuntimeError(
-        "Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed."
+        "Flash Attention 3 is required but was not importable on this Hopper run. "
+        "Expected an official FA3 install providing `import flash_attn_interface` "
+        "(see flash-attention/hopper `python setup.py install`). "
+        f"Loader details: {getattr(_load_fa3, 'last_error', 'no additional details')}"
     )
 
 # wandb
