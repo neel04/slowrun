@@ -539,11 +539,12 @@ class GPT(nn.Module):
 
     def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, cos_sin):
         """Run decoder layers [start, end), with U-Net skip connections."""
+        skip_start = self.config.n_layer - self.encoder_layers
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
             if 0 <= j < self.encoder_layers:
-                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
+                x = x + self.skip_weights[i - skip_start] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
             x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])

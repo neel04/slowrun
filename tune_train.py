@@ -137,7 +137,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--train-script", type=str, default="train.py")
-    parser.add_argument("--print-trial-logs", action="store_true")
+    parser.add_argument("--no-print-trial-logs", dest="print_trial_logs", action="store_false")
+    parser.set_defaults(print_trial_logs=True)
     parser.add_argument("--wandb-project", type=str, default="slowrun")
     parser.add_argument(
         "--wandb-group",
