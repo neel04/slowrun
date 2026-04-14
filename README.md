@@ -51,6 +51,7 @@ The limited-compute track caps runs at a single 8xH100 node for at most 1 hour.
 14 | 3.230 | Switch c_proj init from zero to normal | 04/02/26 | 58.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/146042209ac9ffeff7809f721b2c95dbc6ef87d9/train.py) | [@ms337](https://x.com/madhavsinghal_)
 15 | 3.227 | Add stochastic depth training | 04/06/26 | 58.5 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/038fa4b5ddcacd0d7232564ef3ff58cc97f759dc/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
 16 | 3.222 | Add multi-token prediction loss | 04/09/26 | 57.1 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/549997a53e88f9e6fed9ce18af86945e31257077/train.py) | [@clarkkev](https://github.com/clarkkev)
+17 | 3.214 | Add [Interleaved Head Attention (IHA)](https://arxiv.org/abs/2602.21371) | 04/13/26 | 58.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/bd719090f61d88659bc21e9d7b2e69f781231e75/train.py) | [@ms337](https://x.com/madhavsinghal_)
 
 
 ### Tiny Track (15 minutes)
