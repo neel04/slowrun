@@ -79,6 +79,7 @@ The two hour track caps runs at a single 8xH100 node for at most two hours.
 | # | Val Loss | Description | Date | Time | Script | Contributors |
 | - | - | - | - | - | - | - |
 1 | 3.203 | Baseline, extending the 1 hour multi token prediction result | 04/12/26 | 110.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/7f7b417c4ea5abc9c63eb2e43495d66a1646fa11/two_hour/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
+2 | 3.197 | Add [Interleaved Head Attention (IHA)](https://arxiv.org/abs/2602.21371) | 04/14/26 | 115.0 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/f19b938eacddd1fb8731a42fc8b0a0ca29667686/two_hour/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak), [@ms337](https://x.com/madhavsinghal_)
 
 
 ### Unlimited Compute Track 
