@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 import optuna
+
 import wandb
 
 try:
@@ -137,7 +138,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--train-script", type=str, default="train.py")
-    parser.add_argument("--no-print-trial-logs", dest="print_trial_logs", action="store_false")
+    parser.add_argument(
+        "--no-print-trial-logs", dest="print_trial_logs", action="store_false"
+    )
     parser.set_defaults(print_trial_logs=True)
     parser.add_argument("--wandb-project", type=str, default="slowrun")
     parser.add_argument(
@@ -180,7 +183,9 @@ def effective_num_epochs(args: argparse.Namespace) -> int:
 
 
 def effective_total_batch_size(args: argparse.Namespace) -> int:
-    return fixed_or_default(args.total_batch_size, SOTA_RUN_DEFAULTS["total_batch_size"])
+    return fixed_or_default(
+        args.total_batch_size, SOTA_RUN_DEFAULTS["total_batch_size"]
+    )
 
 
 def tokens_per_fwdbwd(args: argparse.Namespace) -> int:
@@ -505,7 +510,9 @@ def main() -> None:
             wandb.config.update(
                 {
                     "study_name": args.study_name,
-                    "sota_architecture": describe_search_space(args)["fixed_architecture"],
+                    "sota_architecture": describe_search_space(args)[
+                        "fixed_architecture"
+                    ],
                     "sota_run_config": describe_search_space(args)["fixed_run_config"],
                 },
                 allow_val_change=True,
