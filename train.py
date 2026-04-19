@@ -9,6 +9,7 @@ Usage:
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
+import importlib
 import math
 import time
 import json
@@ -92,6 +93,8 @@ parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
 parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
+parser.add_argument("--hira-rank", "--param-relax-rank", dest="hira_rank", type=int, default=8,
+                    help="Rank for per-iteration ABBA parameter relaxation adapters (0=disabled)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -101,6 +104,9 @@ if args.output_json and not args.save_result:
 # =============================================================================
 # Hardwired d12 (GPT-2 small) hyperparameters
 # =============================================================================
+
+# RLM
+NUM_ITERATIONS = 3
 
 # Architecture (defaults = d12 GPT-2 small)
 DEPTH = args.n_layer if args.n_layer is not None else 12
@@ -192,15 +198,26 @@ def load_state_dict_into_model(model, state_dict):
 def _load_fa3():
     if not torch.cuda.is_available():
         return None
+    errors = []
     try:
         major, _ = torch.cuda.get_device_capability()
         if major != 9:
             return None
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    except Exception as exc:
+        errors.append(f"cuda capability check failed: {exc}")
+        return None
+    try:
+        return importlib.import_module("flash_attn_interface")
+    except Exception as exc:
+        errors.append(f"import flash_attn_interface failed: {exc}")
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    try:
         from kernels import get_kernel
         return get_kernel('varunneal/flash-attention-3').flash_attn_interface
-    except Exception:
-        return None
+    except Exception as exc:
+        errors.append(f"kernels.get_kernel('varunneal/flash-attention-3') failed: {exc}")
+    _load_fa3.last_error = " | ".join(errors)
+    return None
 
 _fa3 = _load_fa3()
 
@@ -225,6 +242,8 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
     stoch_depth: float = 0.05
+    num_iterations: int = NUM_ITERATIONS
+    hira_rank: int = 8
     use_iha: bool = False
     iha_mix_v: bool = True
 
@@ -239,6 +258,50 @@ def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], 3)
+
+
+def new_gelu(x):
+    c = math.sqrt(2.0 / math.pi)
+    return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * x.pow(3.0))))
+
+
+def megatron_uniform_(tensor):
+    fan_in, fan_out = tensor.shape
+    std = (0.33 / fan_in) ** 0.5
+    lim = fan_out ** -0.5
+    return torch.nn.init.uniform_(tensor, -lim, lim).mul_(std)
+
+
+class ABBA(nn.Module):
+    """Per-iteration ABBA adapter for relaxing shared recurrent parameters."""
+
+    def __init__(self, in_dim, out_dim, rank):
+        super().__init__()
+        self.out_dim = out_dim
+        self.rank = rank
+        self.scale = 1.0 / rank
+        self.B_1 = nn.Parameter(torch.empty(in_dim, rank))
+        self.A_1 = nn.Parameter(torch.empty(rank, out_dim))
+        self.B_2 = nn.Parameter(torch.empty(in_dim, rank))
+        self.A_2 = nn.Parameter(torch.empty(rank, out_dim))
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        megatron_uniform_(self.B_1)
+        megatron_uniform_(self.A_1)
+        torch.nn.init.zeros_(self.B_2)
+        megatron_uniform_(self.A_2)
+
+    def forward(self, x):
+        a_kr = (
+            (self.A_1.mT.unsqueeze(-1) * self.A_2.mT.unsqueeze(-2))
+            .reshape(self.out_dim, self.rank * self.rank)
+            .transpose(0, 1)
+        ).to(dtype=x.dtype)
+        b_kr = (
+            self.B_1.unsqueeze(-1) * self.B_2.unsqueeze(-2)
+        ).reshape(self.B_1.size(0), self.rank * self.rank).to(dtype=x.dtype)
+        return self.scale * ((x @ b_kr) @ a_kr)
 
 
 class CausalSelfAttention(nn.Module):
@@ -319,24 +382,41 @@ class MLP(nn.Module):
         return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, enable_relax=True):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        if enable_relax and config.hira_rank > 0:
+            self.attn_relax = nn.ModuleList([
+                ABBA(config.n_embd, config.n_embd, config.hira_rank)
+                for _ in range(config.num_iterations)
+            ])
+            self.mlp_relax = nn.ModuleList([
+                ABBA(config.n_embd, config.n_embd, config.hira_rank)
+                for _ in range(config.num_iterations)
+            ])
+        else:
+            self.attn_relax = None
+            self.mlp_relax = None
         # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, iteration_idx=None):
+        x_in = x
+        x_norm = norm(x)
+        attn_out = self.attn(x_norm, ve, cos_sin, window_size)
+        if self.attn_relax is not None and iteration_idx is not None:
+            attn_out = attn_out + new_gelu(self.attn_relax[iteration_idx](x_norm))
+        x = x + attn_out
+        x_norm = norm(x)
+        mlp_out = self.mlp(x_norm)
+        if self.mlp_relax is not None and iteration_idx is not None:
+            mlp_out = mlp_out + new_gelu(self.mlp_relax[iteration_idx](x_norm))
+        x = x + mlp_out
         # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
         if self.training and self.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
-            x_in = x
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
             x = x_in + keep * (x - x_in)
-        else:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
         return x
 
 
@@ -369,7 +449,7 @@ class GPT(nn.Module):
         self.mtp_weight = args.mtp_weight
         if self.mtp_weight > 0:
             self.mtp_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
-            self.mtp_block = Block(config, config.n_layer)
+            self.mtp_block = Block(config, config.n_layer, enable_relax=False)
 
     def set_dupe_layers(self, start, end, loops=2):
         assert start >= self.encoder_layers, "dupe layers must be decoder-only"
@@ -405,6 +485,11 @@ class GPT(nn.Module):
                 torch.nn.init.eye_(block.attn.k_mix)
                 if block.attn.iha_mix_v:
                     torch.nn.init.eye_(block.attn.v_mix)
+            if block.attn_relax is not None:
+                for adapter in block.attn_relax:
+                    adapter.reset_parameters()
+                for adapter in block.mlp_relax:
+                    adapter.reset_parameters()
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
@@ -444,15 +529,38 @@ class GPT(nn.Module):
 
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
+        relax_params = sum(
+            p.numel()
+            for block in self.transformer.h
+            for relax in (block.attn_relax, block.mlp_relax)
+            if relax is not None
+            for p in relax.parameters()
+        )
+        shared_recurrent_params = (
+            sum(p.numel() for p in self.transformer.h.parameters())
+            - relax_params
+            + sum(p.numel() for p in self.ve_projs.parameters())
+        )
         # Exclude non-matmul params: embedding lookup + elementwise scalars
         nparams_exclude = (self.transformer.wte.weight.numel()
                           + self.resid_lambdas.numel()
                           + self.x0_lambdas.numel()
                           + self.skip_weights.numel())
+        extra_nonshared_params = (
+            nparams - nparams_exclude - shared_recurrent_params - relax_params
+        )
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
-        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        attn_flops = self.config.num_iterations * sum(
+            12 * h * q * self._avg_causal_attended_keys(w[0], t)
+            for w in self.window_sizes
+        )
+        effective_params = (
+            extra_nonshared_params
+            + self.config.num_iterations * shared_recurrent_params
+            + relax_params
+        )
+        return 6 * effective_params + attn_flops
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -507,51 +615,49 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
+    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, cos_sin, iteration_idx):
         """Run decoder layers [start, end), with U-Net skip connections."""
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        skip_start = self.config.n_layer - self.encoder_layers
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
             if 0 <= j < self.encoder_layers:
-                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
+                x = x + self.skip_weights[i - skip_start] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], iteration_idx)
         return x
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
-        B, T = idx.size()
-        x = norm(self.transformer.wte(idx))
+    def _run_network_once(self, x, cos_sin, iteration_idx):
         x0 = x
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
-
-        # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], iteration_idx)
             encoder_outputs.append(x)
 
-        # Decoder half
         dupe = self._dupe_layers
         if dupe is None:
             x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, self.config.n_layer, T)
+                                        self.encoder_layers, self.config.n_layer, cos_sin, iteration_idx)
         else:
-            # First pass: encoder boundary through end of dupe range
             x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, dupe[1], T)
-            # Extra replays through dupe range
+                                        self.encoder_layers, dupe[1], cos_sin, iteration_idx)
             for _ in range(self._dupe_loops):
                 x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                            dupe[0], dupe[1], T)
-            # Remaining decoder layers
+                                            dupe[0], dupe[1], cos_sin, iteration_idx)
             x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        dupe[1], self.config.n_layer, T)
+                                        dupe[1], self.config.n_layer, cos_sin, iteration_idx)
+        return x
 
-        x = norm(x)
+    def forward(self, idx, targets=None, loss_reduction='mean'):
+        _, T = idx.size()
+        x = norm(self.transformer.wte(idx))
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        for iteration in range(self.config.num_iterations):
+            x = self._run_network_once(x, cos_sin, iteration)
+            x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
         if targets is None:
@@ -971,7 +1077,12 @@ if device_type == "cuda":
 if _fa3 is not None:
     print0("Using Flash Attention 3 (Hopper GPU detected)")
 else:
-    raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
+    raise RuntimeError(
+        "Flash Attention 3 is required but was not importable on this Hopper run. "
+        "Expected an official FA3 install providing `import flash_attn_interface` "
+        "(see flash-attention/hopper `python setup.py install`). "
+        f"Loader details: {getattr(_load_fa3, 'last_error', 'no additional details')}"
+    )
 
 # Run / logging paths
 run_name, run_dir = resolve_run_dir(args.run_name)
@@ -1006,6 +1117,7 @@ if master_process:
 print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
+print0(f"  num_iterations={NUM_ITERATIONS}, hira_rank={args.hira_rank}")
 print0(f"  stoch_depth={args.stoch_depth}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
@@ -1036,11 +1148,14 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    stoch_depth=args.stoch_depth,
+                   num_iterations=NUM_ITERATIONS,
+                   hira_rank=args.hira_rank,
                    use_iha=args.iha, iha_mix_v=args.iha)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+print0(f"HiRA parameter relaxation: {'enabled' if args.hira_rank > 0 else 'disabled'}")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
