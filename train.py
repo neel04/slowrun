@@ -61,7 +61,10 @@ parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument(
-    "--dupe-start-epoch", type=int, default=7, help="Epoch to enable layer duplication"
+    "--dupe-start-epoch",
+    type=int,
+    default=None,
+    help="Epoch to enable layer duplication (default: disabled)",
 )
 parser.add_argument(
     "--dupe-layers-start",
@@ -1617,7 +1620,11 @@ else:
     model.train()
 
 while not args.eval_logit_avg and current_epoch <= args.num_epochs:
-    if not dupe_active and current_epoch >= args.dupe_start_epoch:
+    if (
+        not dupe_active
+        and args.dupe_start_epoch is not None
+        and current_epoch >= args.dupe_start_epoch
+    ):
         print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
         orig_model.set_dupe_layers(
             args.dupe_layers_start, args.dupe_layers_end, args.dupe_loops
