@@ -160,7 +160,7 @@ parser.add_argument(
     "--param-relax-rank",
     dest="hira_rank",
     type=int,
-    default=8,
+    default=64,
     help="Rank for per-iteration ABBA parameter relaxation adapters (0=disabled)",
 )
 args = parser.parse_args()
@@ -371,9 +371,13 @@ class ABBA(nn.Module):
 
     def __init__(self, in_dim, out_dim, rank):
         super().__init__()
+        self.in_dim = in_dim
         self.out_dim = out_dim
         self.rank = rank
         self.scale = 1.0 / rank
+        # Khatri-Rao is cheaper while rank^2 is below the dense dimension.
+        # At higher ranks, the exact effective weight uses fewer activation FLOPs.
+        self.use_dense_weight = rank * rank * (in_dim + out_dim) >= in_dim * out_dim
         self.B_1 = nn.Parameter(torch.empty(in_dim, rank))
         self.A_1 = nn.Parameter(torch.empty(rank, out_dim))
         self.B_2 = nn.Parameter(torch.empty(in_dim, rank))
@@ -386,7 +390,7 @@ class ABBA(nn.Module):
         torch.nn.init.zeros_(self.B_2)
         megatron_uniform_(self.A_2)
 
-    def forward(self, x):
+    def _forward_rank_squared(self, x):
         a_kr = (
             (self.A_1.mT.unsqueeze(-1) * self.A_2.mT.unsqueeze(-2))
             .reshape(self.out_dim, self.rank * self.rank)
@@ -397,7 +401,25 @@ class ABBA(nn.Module):
             .reshape(self.B_1.size(0), self.rank * self.rank)
             .to(dtype=x.dtype)
         )
-        return self.scale * ((x @ b_kr) @ a_kr)
+        return (x @ b_kr) @ a_kr
+
+    def _forward_dense_weight(self, x):
+        # Equivalent to the rank^2 Khatri-Rao expansion:
+        # b_kr @ a_kr == (B_1 @ A_1) * (B_2 @ A_2).
+        weight = (self.B_1 @ self.A_1) * (self.B_2 @ self.A_2)
+        return x @ weight.to(dtype=x.dtype)
+
+    def forward(self, x):
+        if self.use_dense_weight:
+            out = self._forward_dense_weight(x)
+        else:
+            out = self._forward_rank_squared(x)
+        return self.scale * out
+
+    def compute_matmul_params(self):
+        if self.use_dense_weight:
+            return self.in_dim * self.out_dim
+        return self.rank * self.rank * (self.in_dim + self.out_dim)
 
 
 class CausalSelfAttention(nn.Module):
@@ -649,12 +671,16 @@ class GPT(nn.Module):
 
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
-        relax_params = sum(
-            p.numel()
+        relax_modules = [
+            adapter
             for block in self.transformer.h
             for relax in (block.attn_relax, block.mlp_relax)
             if relax is not None
-            for p in relax.parameters()
+            for adapter in relax
+        ]
+        relax_params = sum(p.numel() for adapter in relax_modules for p in adapter.parameters())
+        relax_compute_params = sum(
+            adapter.compute_matmul_params() for adapter in relax_modules
         )
         shared_recurrent_params = (
             sum(p.numel() for p in self.transformer.h.parameters())
@@ -684,7 +710,7 @@ class GPT(nn.Module):
         effective_params = (
             extra_nonshared_params
             + self.config.num_iterations * shared_recurrent_params
-            + relax_params
+            + relax_compute_params
         )
         return 6 * effective_params + attn_flops
 
