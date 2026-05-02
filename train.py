@@ -163,6 +163,12 @@ parser.add_argument(
     default=64,
     help="Rank for per-iteration ABBA parameter relaxation adapters (0=disabled)",
 )
+parser.add_argument(
+    "--debug-timing-steps",
+    type=int,
+    default=0,
+    help="Print per-section timings for the first N training steps",
+)
 args = parser.parse_args()
 
 # Resolve output path
@@ -1021,16 +1027,36 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
-        self._adamw_step_t = torch.tensor(0.0)
-        self._adamw_lr_t = torch.tensor(0.0)
-        self._adamw_beta1_t = torch.tensor(0.0)
-        self._adamw_beta2_t = torch.tensor(0.0)
-        self._adamw_eps_t = torch.tensor(0.0)
-        self._adamw_wd_t = torch.tensor(0.0)
-        self._muon_momentum_t = torch.tensor(0.0)
-        self._muon_lr_t = torch.tensor(0.0)
-        self._muon_wd_t = torch.tensor(0.0)
-        self._muon_beta2_t = torch.tensor(0.0)
+        self._scalar_device = None
+        self._adamw_step_t = torch.empty(())
+        self._adamw_lr_t = torch.empty(())
+        self._adamw_beta1_t = torch.empty(())
+        self._adamw_beta2_t = torch.empty(())
+        self._adamw_eps_t = torch.empty(())
+        self._adamw_wd_t = torch.empty(())
+        self._muon_momentum_t = torch.empty(())
+        self._muon_lr_t = torch.empty(())
+        self._muon_wd_t = torch.empty(())
+        self._muon_beta2_t = torch.empty(())
+        self._group_buffers = {}
+
+    def _ensure_scalar_tensors(self, device):
+        if self._scalar_device == device:
+            return
+        self._scalar_device = device
+        self._adamw_step_t = torch.empty((), device=device)
+        self._adamw_lr_t = torch.empty((), device=device)
+        self._adamw_beta1_t = torch.empty((), device=device)
+        self._adamw_beta2_t = torch.empty((), device=device)
+        self._adamw_eps_t = torch.empty((), device=device)
+        self._adamw_wd_t = torch.empty((), device=device)
+        self._muon_momentum_t = torch.empty((), device=device)
+        self._muon_lr_t = torch.empty((), device=device)
+        self._muon_wd_t = torch.empty((), device=device)
+        self._muon_beta2_t = torch.empty((), device=device)
+
+    def _buffers_for_group(self, group):
+        return self._group_buffers.setdefault(id(group), {})
 
     def _reduce_adamw(self, group, world_size):
         infos = {}
@@ -1044,7 +1070,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
             else:
                 assert grad.shape[0] % world_size == 0
                 rank_size = grad.shape[0] // world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
+                state = self.state[p]
+                grad_slice = state.get("_grad_slice")
+                if grad_slice is None:
+                    grad_slice = torch.empty_like(grad[:rank_size])
+                    state["_grad_slice"] = grad_slice
                 future = dist.reduce_scatter_tensor(
                     grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True
                 ).get_future()
@@ -1057,11 +1087,21 @@ class DistMuonAdamW(torch.optim.Optimizer):
         padded = chunk_size * world_size
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
-        stacked_grads = torch.empty(padded, *shape, dtype=dtype, device=device)
-        stacked_grads[: len(params)].copy_(torch.stack([p.grad for p in params]))
+        buffers = self._buffers_for_group(group)
+        stacked_grads = buffers.get("stacked_grads")
+        if stacked_grads is None:
+            stacked_grads = torch.empty(padded, *shape, dtype=dtype, device=device)
+            buffers["stacked_grads"] = stacked_grads
+            buffers["stacked_grad_views"] = list(
+                stacked_grads[: len(params)].unbind(0)
+            )
+        torch._foreach_copy_(buffers["stacked_grad_views"], [p.grad for p in params])
         if len(params) < padded:
             stacked_grads[len(params) :].zero_()
-        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        grad_chunk = buffers.get("grad_chunk")
+        if grad_chunk is None:
+            grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+            buffers["grad_chunk"] = grad_chunk
         future = dist.reduce_scatter_tensor(
             grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
         ).get_future()
@@ -1082,7 +1122,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             else:
                 rank_size = p.shape[0] // world_size
                 p_slice = p[rank * rank_size : (rank + 1) * rank_size]
-            if not state:
+            if "step" not in state:
                 state["step"] = 0
                 state["exp_avg"] = torch.zeros_like(p_slice)
                 state["exp_avg_sq"] = torch.zeros_like(p_slice)
@@ -1132,16 +1172,25 @@ class DistMuonAdamW(torch.optim.Optimizer):
             )
             state["second_momentum_buffer"] = torch.zeros(s, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
-        updated = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        buffers = self._buffers_for_group(group)
+        updated = buffers.get("updated")
+        if updated is None:
+            updated = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+            buffers["updated"] = updated
+            buffers["updated_views"] = list(updated.unbind(0))
         if num_owned > 0:
-            owned = torch.stack([params[start_idx + i] for i in range(num_owned)])
+            updated_owned = updated[:num_owned]
+            torch._foreach_copy_(
+                buffers["updated_views"][:num_owned],
+                [params[start_idx + i] for i in range(num_owned)],
+            )
             self._muon_momentum_t.fill_(group["momentum"])
             self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(
                 info["grad_chunk"][:num_owned],
-                owned,
+                updated_owned,
                 state["momentum_buffer"][:num_owned],
                 state["second_momentum_buffer"][:num_owned],
                 self._muon_momentum_t,
@@ -1151,7 +1200,6 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 group["ns_steps"],
                 red_dim,
             )
-            updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
             updated[num_owned:].zero_()
         stacked_params = info["stacked_grads"]
@@ -1164,6 +1212,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        for group in self.param_groups:
+            if group["params"]:
+                self._ensure_scalar_tensors(group["params"][0].device)
+                break
         rank, world_size = dist.get_rank(), dist.get_world_size()
         reduce_infos = []
         for group in self.param_groups:
@@ -1413,6 +1465,21 @@ autocast_ctx = (
 )
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+
+
+def debug_memory_stats():
+    if device_type != "cuda":
+        return ""
+    stats = torch.cuda.memory_stats(device)
+    allocated = torch.cuda.memory_allocated(device) / 1e9
+    reserved = torch.cuda.memory_reserved(device) / 1e9
+    inactive = stats.get("inactive_split_bytes.all.current", 0) / 1e9
+    retries = stats.get("num_alloc_retries", 0)
+    return (
+        f" | mem: alloc={allocated:.2f}G reserved={reserved:.2f}G"
+        f" inactive={inactive:.2f}G alloc_retries={retries}"
+    )
+
 
 # GPU info for MFU
 gpu_peak_flops = float("inf")
@@ -1665,12 +1732,24 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
+    debug_timing = args.debug_timing_steps > 0 and step < args.debug_timing_steps
+    timings = {"fwd_bwd": 0.0, "data": 0.0} if debug_timing else None
     for micro_step in range(grad_accum_steps):
+        if debug_timing:
+            synchronize()
+            section_t0 = time.time()
         with autocast_ctx:
             loss, metrics = model(x, y)
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
+        if debug_timing:
+            synchronize()
+            timings["fwd_bwd"] += time.time() - section_t0
+            section_t0 = time.time()
         x, y, epoch = next(train_loader)
+        if debug_timing:
+            synchronize()
+            timings["data"] += time.time() - section_t0
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
@@ -1689,8 +1768,18 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         group["weight_decay"] = group["initial_wd"] * wdm
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
+    if debug_timing:
+        synchronize()
+        section_t0 = time.time()
     optimizer.step()
+    if debug_timing:
+        synchronize()
+        timings["optimizer"] = time.time() - section_t0
+        section_t0 = time.time()
     model.zero_grad(set_to_none=True)
+    if debug_timing:
+        synchronize()
+        timings["zero_grad"] = time.time() - section_t0
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
@@ -1722,10 +1811,21 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     print0(
         f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}"
     )
+    timing_metrics = {}
+    if timings is not None:
+        section_sum = sum(timings.values())
+        print0(
+            "  timing | "
+            + " ".join(f"{k}={v * 1000:.2f}ms" for k, v in timings.items())
+            + f" accounted={section_sum / dt * 100:.1f}%"
+            + debug_memory_stats()
+        )
+        timing_metrics = {f"timing/{k}_ms": v * 1000 for k, v in timings.items()}
     wandb_run.log({
         "step": step,
         "train/loss": debiased,
         "train/mfu": mfu,
+        **timing_metrics,
         **{f"train/{k}": v.item() for k, v in metrics.items()},
     })
 
