@@ -253,18 +253,24 @@ class DummyWandb:
 
 class TeeStream:
     """Save terminal output to file."""
+
     def __init__(self, *streams):
         self.streams = streams
         self.encoding = getattr(streams[0], "encoding", "utf-8")
+
     def write(self, data):
         for stream in self.streams: stream.write(data)
         return len(data)
+
     def flush(self):
         for stream in self.streams: stream.flush()
+
     def isatty(self):
         return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
     def fileno(self):
         return self.streams[0].fileno()
+
 
 def resolve_run_dir(run_name):
     if run_name:
@@ -272,7 +278,7 @@ def resolve_run_dir(run_name):
     name = time.strftime('%Y%m%d_%H%M%S')
     return name, os.path.join(RUNS_DIR, name)
 
-# =============================================================================
+
 def load_state_dict_into_model(model, state_dict):
     """Load a state dict into model, handling dtype conversion."""
     for name, p in model.named_parameters():
@@ -468,6 +474,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
+
         if self.use_iha:
             # Fuse mixing into weights then project — grad flows through mix params
             q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
@@ -485,15 +492,19 @@ class CausalSelfAttention(nn.Module):
             q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
             k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
             v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
         # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
+
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(
             self.attn_gate(x[..., : self.attn_gate_channels])
@@ -537,16 +548,19 @@ class Block(nn.Module):
 
     def forward(self, x, ve, cos_sin, window_size, iteration_idx=None):
         x_in = x
+
         x_norm = norm(x)
         attn_out = self.attn(x_norm, ve, cos_sin, window_size)
         if self.attn_relax is not None and iteration_idx is not None:
             attn_out = attn_out + new_gelu(self.attn_relax[iteration_idx](x_norm))
         x = x + attn_out
+
         x_norm = norm(x)
         mlp_out = self.mlp(x_norm)
         if self.mlp_relax is not None and iteration_idx is not None:
             mlp_out = mlp_out + new_gelu(self.mlp_relax[iteration_idx](x_norm))
         x = x + mlp_out
+
         # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
         if self.training and self.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
@@ -559,18 +573,22 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
+
         padded_vocab = (
             (config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to
         ) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
+
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
+
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.ve_projs = nn.ModuleDict({
@@ -578,14 +596,18 @@ class GPT(nn.Module):
             for i in range(config.n_layer)
             if has_ve(i, config.n_layer)
         })
+
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
+
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+
         self._dupe_layers = None  # (start, end) or None
+
         self.mtp_weight = args.mtp_weight
         if self.mtp_weight > 0:
             self.mtp_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
@@ -604,8 +626,10 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+
         s = 3**0.5 * self.config.n_embd**-0.5
         normal_std = self.config.n_embd**-0.5
+
         all_blocks = list(self.transformer.h)
         if self.mtp_weight > 0:
             all_blocks.append(self.mtp_block)
@@ -632,15 +656,18 @@ class GPT(nn.Module):
                     adapter.reset_parameters()
                 for adapter in block.mlp_relax:
                     adapter.reset_parameters()
+
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         self.skip_weights.fill_(1.0)
+
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
         self.cos = cos
         self.sin = sin
+
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
@@ -751,6 +778,7 @@ class GPT(nn.Module):
                 if id(p) not in iha_param_ids
             ]
             matrix_params += mtp_params
+
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -758,6 +786,7 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
 
+        # Build param groups
         param_groups = [
             dict(
                 kind="adamw",
@@ -908,13 +937,17 @@ class GPT(nn.Module):
         _, T = idx.size()
         x = norm(self.transformer.wte(idx))
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
+
         for iteration in range(self.config.num_iterations):
             x = self._run_network_once(x, cos_sin, iteration)
             x = norm(x)
+
         logits = self.lm_head(x)[..., : self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
+
         if targets is None:
             return logits
+
         lm_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
@@ -923,8 +956,10 @@ class GPT(nn.Module):
         )
         if loss_reduction != "mean":
             return lm_loss
+
         if self.mtp_weight <= 0:
             return lm_loss, {"lm_loss": lm_loss}
+
         mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
         combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
         mT = combined.size(1)
@@ -936,6 +971,7 @@ class GPT(nn.Module):
         mtp_logits = self.lm_head(mtp_out)[..., : self.config.vocab_size].float()
         if LOGIT_CAP > 0:
             mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
+
         mtp_loss = F.cross_entropy(
             mtp_logits.view(-1, mtp_logits.size(-1)),
             targets[:, 1:].reshape(-1),
@@ -1458,6 +1494,7 @@ else:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 device_type = device.type
+
 autocast_ctx = (
     torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
     if device_type == "cuda"
@@ -1663,6 +1700,7 @@ _swa_start_step = (
     else -1
 )
 
+
 def get_wd_multiplier(it):
     """Anti-phase WD: hold at 1.0 pre-SWA, decay to LOW by SWA start, then sawtooth LOW→HIGH per SWA epoch (anti-phase with the LR cosine cycle)."""
     if _swa_start_step >= 0 and it >= _swa_start_step:
@@ -1677,6 +1715,7 @@ def get_wd_multiplier(it):
     decay_frac = min(max(decay_frac, 0.0), 1.0)
     return 1.0 - (1.0 - WD_SWA_LOW_FACTOR) * decay_frac
 
+
 # Training loop
 step = 0
 min_val_bpb = float("inf")
@@ -1689,6 +1728,7 @@ timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 dupe_active = False
 
+# Logit averaging setup
 late_checkpoint_paths = []  # paths to saved epoch checkpoints for logit averaging
 logit_avg_count = args.logit_avg
 if logit_avg_count > 0 and master_process:
@@ -1751,7 +1791,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             synchronize()
             timings["data"] += time.time() - section_t0
 
-    # Update optimizer
+    # Update LR/WD/momentum
     lrm = get_lr_multiplier(step)
     # SWA: cosine-cycle LR in final epochs for diverse checkpoints to average
     if _swa_start_step >= 0 and step >= _swa_start_step:
@@ -1768,6 +1808,8 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         group["weight_decay"] = group["initial_wd"] * wdm
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
+
+    # Optimizer step
     if debug_timing:
         synchronize()
         section_t0 = time.time()
@@ -1780,6 +1822,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     if debug_timing:
         synchronize()
         timings["zero_grad"] = time.time() - section_t0
+
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
@@ -1850,6 +1893,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             "val/bpb": val_bpb,
             "val/loss": val_loss,
         })
+
         # Early stopping
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -1860,6 +1904,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             if args.patience >= 0 and epochs_without_improvement >= args.patience:
                 print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
                 break
+
         # Save checkpoint to disk for logit averaging
         if logit_avg_count > 0:
             ckpt_path = os.path.join(
@@ -1882,10 +1927,6 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             )
 
         model.train()
-        # Update num_iterations estimate now that we know real steps per epoch
-        # steps_per_epoch = step // current_epoch
-        # num_iterations = steps_per_epoch * args.num_epochs
-        # print0(f"Epoch {current_epoch} took {steps_per_epoch} steps. Updated estimate: {num_iterations} total steps.")
         current_epoch = epoch
 
     # GC management
@@ -1954,6 +1995,7 @@ final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float("i
 print0(f"Final train loss: {final_train_loss:.6f}")
 print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
+
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
 
@@ -1975,8 +2017,10 @@ total_wall_time = time.time() - _script_start
 print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time / 60:.2f}m)")
 
 wandb_run.finish()
+
 if dist.is_initialized():
     dist.destroy_process_group()
+
 if artifacts_log_f is not None:
     sys.stdout.flush()
     sys.stderr.flush()
