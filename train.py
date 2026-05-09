@@ -65,8 +65,8 @@ parser.add_argument(
     choices=["constant", "compute-matched"],
     help=(
         "Schedule recurrent iterations over training. "
-        "'compute-matched' starts at --min-iterations and switches to "
-        "--num-iterations so average layer-passes match --compute-equivalent-layers."
+        "'compute-matched' ramps from --min-iterations through each integer stage "
+        "to --num-iterations so average layer-passes match --compute-equivalent-layers."
     ),
 )
 parser.add_argument(
@@ -328,28 +328,57 @@ def build_iteration_schedule(
             target_effective_layers=target_effective_layers,
         )
 
-    min_frac = (max_iterations - target_iterations) / (
-        max_iterations - min_iterations
-    )
-    min_frac = min(max(min_frac, 0.0), 1.0)
-    warmdown_start_frac = max(0.0, 1.0 - warmdown_ratio)
-    if min_frac > warmdown_start_frac + 1e-9:
+    warmdown_duration = min(max(warmdown_ratio, 0.0), 1.0)
+    extra_iterations = target_iterations - min_iterations
+    threshold_count = max_iterations - min_iterations
+    min_extra_with_max_before_warmdown = threshold_count * warmdown_duration
+    if extra_iterations < min_extra_with_max_before_warmdown - 1e-9:
+        warmdown_start_frac = 1.0 - warmdown_duration
         raise ValueError(
-            "Compute-matched schedule would reach --num-iterations at "
-            f"{min_frac:.3f} of training, after warmdown starts at "
-            f"{warmdown_start_frac:.3f}. Increase --compute-equivalent-layers, "
-            "increase --num-iterations, or reduce --warmdown-ratio."
+            "Compute-matched schedule cannot reach --num-iterations by warmdown "
+            f"start ({warmdown_start_frac:.3f}) without exceeding the compute "
+            f"target. Minimum average iterations would be "
+            f"{min_iterations + min_extra_with_max_before_warmdown:.3f}, "
+            f"but target is {target_iterations:.3f}."
         )
 
-    if min_frac <= 1e-9:
-        stages = (IterationScheduleStage(0.0, 1.0, max_iterations),)
-    elif min_frac >= 1.0 - 1e-9:
-        stages = (IterationScheduleStage(0.0, 1.0, min_iterations),)
-    else:
-        stages = (
-            IterationScheduleStage(0.0, min_frac, min_iterations),
-            IterationScheduleStage(min_frac, 1.0, max_iterations),
+    suffix_durations = [warmdown_duration] * threshold_count
+    remaining_extra = extra_iterations - min_extra_with_max_before_warmdown
+    for i in range(threshold_count):
+        capacity = 1.0 - suffix_durations[i]
+        add = min(remaining_extra, capacity)
+        suffix_durations[i] += add
+        remaining_extra -= add
+        if remaining_extra <= 1e-9:
+            break
+    if remaining_extra > 1e-9:
+        raise ValueError(
+            "Could not build compute-matched iteration schedule; target average "
+            f"iterations {target_iterations:.3f} is too high"
         )
+
+    durations = [1.0 - suffix_durations[0]]
+    for i in range(1, threshold_count):
+        durations.append(suffix_durations[i - 1] - suffix_durations[i])
+    durations.append(suffix_durations[-1])
+
+    stages = []
+    start_frac = 0.0
+    for offset, duration in enumerate(durations):
+        if duration <= 1e-9:
+            continue
+        end_frac = min(1.0, start_frac + duration)
+        stages.append(
+            IterationScheduleStage(start_frac, end_frac, min_iterations + offset)
+        )
+        start_frac = end_frac
+    if stages:
+        stages[-1] = IterationScheduleStage(
+            stages[-1].start_frac, 1.0, stages[-1].iterations
+        )
+    else:
+        stages = [IterationScheduleStage(0.0, 1.0, max_iterations)]
+    stages = tuple(stages)
 
     avg_iterations = sum(
         (stage.end_frac - stage.start_frac) * stage.iterations for stage in stages
@@ -376,6 +405,10 @@ def format_iteration_schedule(schedule):
         f"{stage.start_frac:.3f}-{stage.end_frac:.3f}: {stage.iterations}x"
         for stage in schedule.stages
     )
+
+
+def iteration_schedule_counts(schedule):
+    return tuple(dict.fromkeys(stage.iterations for stage in schedule.stages))
 
 
 ITERATION_SCHEDULE = build_iteration_schedule(
@@ -1109,7 +1142,7 @@ class GPT(nn.Module):
         x = norm(self.transformer.wte(idx))
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
 
-        for iteration in range(self.config.num_iterations):
+        for iteration in range(active_num_iterations):
             x = self._run_network_once(x, cos_sin, iteration)
             x = norm(x)
 
@@ -1188,12 +1221,15 @@ def muon_step_fused(
     lr_t,
     wd_t,
     beta2_t,
+    active_mask,
     ns_steps,
     red_dim,
 ):
     momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    active = active_mask.to(stacked_grads.dtype)
+    momentum_update = (1 - momentum) * active
+    momentum_buffer.mul_(1 - momentum_update).add_(stacked_grads * momentum_update)
+    g = stacked_grads.lerp(momentum_buffer, momentum) * active
     # MuonEq-R row normalization
     g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
     # Polar Express orthogonalization
@@ -1214,8 +1250,9 @@ def muon_step_fused(
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(
-        v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2
+    second_momentum_update = (1 - beta2) * active.to(second_momentum_buffer.dtype)
+    second_momentum_buffer.mul_(1 - second_momentum_update).add_(
+        v_mean.to(dtype=second_momentum_buffer.dtype) * second_momentum_update
     )
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
@@ -1226,7 +1263,7 @@ def muon_step_fused(
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+    stacked_params.sub_((lr * g + lr * wd * stacked_params * mask) * active)
 
 
 class DistMuonAdamW(torch.optim.Optimizer):
@@ -1269,6 +1306,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         infos = {}
         for p in group["params"]:
             grad = p.grad
+            if grad is None:
+                continue
             if p.numel() < 1024:
                 future = dist.all_reduce(
                     grad, op=dist.ReduceOp.AVG, async_op=True
@@ -1302,9 +1341,21 @@ class DistMuonAdamW(torch.optim.Optimizer):
             buffers["stacked_grad_views"] = list(
                 stacked_grads[: len(params)].unbind(0)
             )
-        torch._foreach_copy_(buffers["stacked_grad_views"], [p.grad for p in params])
+        active_mask_shape = (padded,) + (1,) * len(shape)
+        active_mask = buffers.get("active_mask")
+        if active_mask is None:
+            active_mask = torch.empty(active_mask_shape, dtype=torch.bool, device=device)
+            buffers["active_mask"] = active_mask
+        active_mask.zero_()
+        for i, p in enumerate(params):
+            if p.grad is None:
+                buffers["stacked_grad_views"][i].zero_()
+            else:
+                buffers["stacked_grad_views"][i].copy_(p.grad)
+                active_mask[i].fill_(True)
         if len(params) < padded:
             stacked_grads[len(params) :].zero_()
+            active_mask[len(params) :].zero_()
         grad_chunk = buffers.get("grad_chunk")
         if grad_chunk is None:
             grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
@@ -1316,12 +1367,12 @@ class DistMuonAdamW(torch.optim.Optimizer):
             future=future,
             grad_chunk=grad_chunk,
             stacked_grads=stacked_grads,
+            active_mask=active_mask,
             chunk_size=chunk_size,
         )
 
     def _compute_adamw(self, group, info, gather_list, rank, world_size):
-        for p in group["params"]:
-            pinfo = info["param_infos"][p]
+        for p, pinfo in info["param_infos"].items():
             pinfo["future"].wait()
             state = self.state[p]
             if pinfo["is_small"]:
@@ -1404,6 +1455,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 self._muon_lr_t,
                 self._muon_wd_t,
                 self._muon_beta2_t,
+                info["active_mask"][start_idx : start_idx + num_owned],
                 group["ns_steps"],
                 red_dim,
             )
@@ -1691,6 +1743,28 @@ def debug_memory_stats():
     )
 
 
+def precompile_iteration_stages(model, x, y, iteration_counts):
+    if len(iteration_counts) <= 1:
+        return
+    print0(f"Precompiling recurrent iteration stages: {iteration_counts}")
+    was_training = model.training
+    for count in iteration_counts:
+        model.train()
+        model.zero_grad(set_to_none=True)
+        with autocast_ctx:
+            loss, _ = model(x, y, num_iterations=count)
+        loss.backward()
+        model.zero_grad(set_to_none=True)
+
+        model.eval()
+        with torch.no_grad():
+            with autocast_ctx:
+                model(x, y, loss_reduction="none", num_iterations=count)
+        synchronize()
+    model.train(was_training)
+    model.zero_grad(set_to_none=True)
+
+
 # GPU info for MFU
 gpu_peak_flops = float("inf")
 if device_type == "cuda":
@@ -1807,9 +1881,10 @@ ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
 other_params = param_counts - transformer_params - ve_params - lm_head_params
 max_flops_per_token = model.estimate_flops(NUM_ITERATIONS)
+scheduled_iteration_counts = iteration_schedule_counts(ITERATION_SCHEDULE)
 schedule_flops_per_token = {
-    stage.iterations: model.estimate_flops(stage.iterations)
-    for stage in ITERATION_SCHEDULE.stages
+    iteration_count: model.estimate_flops(iteration_count)
+    for iteration_count in scheduled_iteration_counts
 }
 avg_flops_per_token = sum(
     (stage.end_frac - stage.start_frac)
@@ -1935,6 +2010,9 @@ if logit_avg_count > 0:
     print0(
         f"Logit averaging: saving last {logit_avg_count} epoch checkpoints to {args.logit_avg_dir}/"
     )
+
+if not args.eval_logit_avg:
+    precompile_iteration_stages(model, x, y, scheduled_iteration_counts)
 
 if args.eval_logit_avg:
     print0("--eval-logit-avg set: skipping training, loading checkpoints from disk.")
