@@ -79,7 +79,22 @@ parser.add_argument(
     "--compute-equivalent-layers",
     type=float,
     default=30.0,
-    help="Target average effective layer-passes per token for compute-matched schedule",
+    help=(
+        "Target average baseline-width-equivalent layer-passes per token for "
+        "compute-matched schedule"
+    ),
+)
+parser.add_argument(
+    "--compute-reference-n-embd",
+    type=float,
+    default=1792.0,
+    help="Reference model width used by --compute-equivalent-layers",
+)
+parser.add_argument(
+    "--compute-width-power",
+    type=float,
+    default=2.0,
+    help="Width scaling exponent for compute matching; dense matmuls are ~2.0",
 )
 parser.add_argument("--n_head", type=int, default=14)
 parser.add_argument("--n_embd", type=int, default=1792)
@@ -216,6 +231,9 @@ DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
+if args.compute_reference_n_embd <= 0:
+    raise ValueError("--compute-reference-n-embd must be > 0")
+COMPUTE_WIDTH_SCALE = (N_EMBD / args.compute_reference_n_embd) ** args.compute_width_power
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -281,6 +299,7 @@ class IterationSchedule:
     stages: tuple
     avg_iterations: float
     target_effective_layers: float
+    width_compute_scale: float
 
 
 def build_iteration_schedule(
@@ -289,6 +308,7 @@ def build_iteration_schedule(
     max_iterations,
     n_layer,
     target_effective_layers,
+    width_compute_scale,
     warmdown_ratio,
 ):
     if max_iterations < 1:
@@ -299,20 +319,24 @@ def build_iteration_schedule(
         raise ValueError("--min-iterations must be <= --num-iterations")
     if n_layer <= 0:
         raise ValueError("--n_layer must be > 0")
+    if width_compute_scale <= 0:
+        raise ValueError("width_compute_scale must be > 0")
 
     if schedule_name == "constant":
         avg_iterations = float(max_iterations)
         return IterationSchedule(
             stages=(IterationScheduleStage(0.0, 1.0, max_iterations),),
             avg_iterations=avg_iterations,
-            target_effective_layers=n_layer * avg_iterations,
+            target_effective_layers=n_layer * avg_iterations * width_compute_scale,
+            width_compute_scale=width_compute_scale,
         )
 
-    target_iterations = target_effective_layers / n_layer
+    target_iterations = target_effective_layers / (n_layer * width_compute_scale)
     if target_iterations < min_iterations or target_iterations > max_iterations:
         raise ValueError(
             "--compute-equivalent-layers requires an average of "
-            f"{target_iterations:.3f} iterations for n_layer={n_layer}, outside "
+            f"{target_iterations:.3f} iterations for n_layer={n_layer} "
+            f"and width_compute_scale={width_compute_scale:.3f}, outside "
             f"[--min-iterations={min_iterations}, --num-iterations={max_iterations}]"
         )
 
@@ -326,6 +350,7 @@ def build_iteration_schedule(
             stages=(IterationScheduleStage(0.0, 1.0, max_iterations),),
             avg_iterations=float(max_iterations),
             target_effective_layers=target_effective_layers,
+            width_compute_scale=width_compute_scale,
         )
 
     warmdown_duration = min(max(warmdown_ratio, 0.0), 1.0)
@@ -387,6 +412,7 @@ def build_iteration_schedule(
         stages=stages,
         avg_iterations=avg_iterations,
         target_effective_layers=target_effective_layers,
+        width_compute_scale=width_compute_scale,
     )
 
 
@@ -417,6 +443,7 @@ ITERATION_SCHEDULE = build_iteration_schedule(
     NUM_ITERATIONS,
     DEPTH,
     args.compute_equivalent_layers,
+    COMPUTE_WIDTH_SCALE,
     WARMDOWN_RATIO,
 )
 
@@ -1824,7 +1851,13 @@ print0(f"  max_num_iterations={NUM_ITERATIONS}, hira_rank={args.hira_rank}")
 print0(
     f"  iteration_schedule={args.iteration_schedule} "
     f"({format_iteration_schedule(ITERATION_SCHEDULE)}), "
-    f"avg_effective_layers={DEPTH * ITERATION_SCHEDULE.avg_iterations:.3f}"
+    f"avg_layer_passes={DEPTH * ITERATION_SCHEDULE.avg_iterations:.3f}, "
+    f"avg_compute_equiv_layers={DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE:.3f}"
+)
+print0(
+    f"  compute_reference_n_embd={args.compute_reference_n_embd}, "
+    f"compute_width_power={args.compute_width_power}, "
+    f"compute_width_scale={COMPUTE_WIDTH_SCALE:.3f}"
 )
 print0(f"  stoch_depth={args.stoch_depth}")
 print0(
@@ -2346,6 +2379,13 @@ if master_process:
             for stage in ITERATION_SCHEDULE.stages
         ],
         "avg_effective_layers": DEPTH * ITERATION_SCHEDULE.avg_iterations,
+        "avg_effective_layer_passes": DEPTH * ITERATION_SCHEDULE.avg_iterations,
+        "avg_compute_equivalent_layers": (
+            DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE
+        ),
+        "compute_reference_n_embd": args.compute_reference_n_embd,
+        "compute_width_power": args.compute_width_power,
+        "compute_width_scale": COMPUTE_WIDTH_SCALE,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
