@@ -265,10 +265,10 @@ WD_PRE_HOLD_FRAC = 0.40   # hold at base WD for first 40% of training, then deca
 WD_SWA_LOW_FACTOR = 0.65  # WD at start of each SWA epoch (LR is high → less regularization)
 WD_SWA_HIGH_FACTOR = 1.50 # WD at end of each SWA epoch (LR has decayed → more regularization)
 LOGIT_CAP = args.logit_cap
-FINAL_EXTRA_EVAL_ITERATIONS = 3
+FINAL_EXTRA_EVAL_ITERATIONS = 2
 # TRM-style truncated recurrence: keep the requested number of forward passes,
 # but retain autograd only for the final N recurrent iterations during training.
-TRAIN_BACKPROP_ITERATIONS = 2
+TRAIN_BACKPROP_ITERATIONS = 1
 if TRAIN_BACKPROP_ITERATIONS < 1:
     raise ValueError("TRAIN_BACKPROP_ITERATIONS must be >= 1")
 
