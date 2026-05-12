@@ -1,0 +1,27 @@
+[project]
+name = "slowrun"
+version = "0.1.0"
+description = "Slowrun language model training scripts"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.10",
+    "jax[cpu]",
+    "equinox",
+    "optax",
+    "orbax-checkpoint",
+    "wandb",
+    "tiktoken",
+    "numpy",
+    "datasets",
+    "tqdm",
+    "kernels",
+]
+
+[project.optional-dependencies]
+tpu = [
+    "jax[tpu]",
+]
+
+[tool.uv]
+package = false
