@@ -42,8 +42,11 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax  # noqa: F401  # kept as an explicit dependency for the JAX training stack
 import tiktoken
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
+
 import wandb
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 _script_start = time.time()
 
@@ -56,8 +59,12 @@ parser = argparse.ArgumentParser(description="Train GPT model with JAX/Equinox")
 parser.add_argument("--device-batch-size", type=int, default=4)
 parser.add_argument("--num-epochs", type=int, default=11)
 parser.add_argument("--patience", type=int, default=-1)
-parser.add_argument("--run-name", type=str, default=None,
-                    help="Run name under runs/ (default: timestamp)")
+parser.add_argument(
+    "--run-name",
+    type=str,
+    default=None,
+    help="Run name under runs/ (default: timestamp)",
+)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--weight-decay", type=float, default=1.3)
@@ -72,56 +79,131 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--dupe-start-epoch", type=int, default=7,
-                    help="Epoch to enable layer duplication")
-parser.add_argument("--dupe-layers-start", type=int, default=15,
-                    help="First decoder layer to duplicate (inclusive)")
-parser.add_argument("--dupe-layers-end", type=int, default=21,
-                    help="Last decoder layer to duplicate (exclusive)")
-parser.add_argument("--dupe-loops", type=int, default=2,
-                    help="Number of extra replay passes through dupe layers")
-parser.add_argument("--warmdown-ratio", type=float, default=None,
-                    help="Override warmdown ratio (default 0.2)")
-parser.add_argument("--logit-cap", type=float, default=10.0,
-                    help="Logit soft-capping value (0=disabled)")
-parser.add_argument("--logit-avg", type=int, default=3,
-                    help="Number of late checkpoints for probability averaging (0=disabled)")
-parser.add_argument("--logit-avg-dir", type=str, default="logit_avg_ckpts",
-                    help="Directory to save/load epoch checkpoints for logit averaging")
-parser.add_argument("--logit-avg-mode", type=str, default="both",
-                    choices=["equal", "weighted", "both"],
-                    help="Weight scheme: equal, linear recency weighted, or compare both")
-parser.add_argument("--eval-logit-avg", action="store_true",
-                    help="Skip training and only run logit-avg eval on saved checkpoints")
-parser.add_argument("--swa-last-epochs", type=int, default=3,
-                    help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
-parser.add_argument("--stoch-depth", type=float, default=0.05,
-                    help="Stochastic depth max drop rate (linear schedule, 0=off)")
-parser.add_argument("--mtp-weight", type=float, default=0.3,
-                    help="Multi-token prediction weight (0=off)")
-parser.add_argument("--iha", action="store_true", default=True,
-                    help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
-parser.add_argument("--no-iha", action="store_false", dest="iha",
-                    help="Disable IHA cross-head mixing")
-parser.add_argument("--iha-lr", type=float, default=0.02,
-                    help="LR for IHA mixing matrices")
-parser.add_argument("--no-doc-shuffle", action="store_true",
-                    help="Disable per-epoch document reshuffling (still shuffles batch order)")
-parser.add_argument("--sequence-length", type=int, default=2048,
-                    help="Static sequence length. Keep 2048 for benchmark runs.")
-parser.add_argument("--eval-tokens", type=int, default=10_000_000,
-                    help="Validation token budget")
-parser.add_argument("--compute-dtype", type=str, default="bfloat16",
-                    choices=["bfloat16", "float32"],
-                    help="Activation/matmul dtype. bfloat16 is the TPU path.")
-parser.add_argument("--jax-distributed", action="store_true",
-                    help="Call jax.distributed.initialize() at startup for TPU multi-host jobs")
-parser.add_argument("--compile-cache-dir", type=str, default="",
-                    help="Optional JAX persistent compilation cache directory")
-parser.add_argument("--log-compiles", action="store_true",
-                    help="Log JAX compilations/cache misses")
-parser.add_argument("--disable-wandb", action="store_true",
-                    help="Disable WandB even on process 0")
+parser.add_argument(
+    "--dupe-start-epoch", type=int, default=7, help="Epoch to enable layer duplication"
+)
+parser.add_argument(
+    "--dupe-layers-start",
+    type=int,
+    default=15,
+    help="First decoder layer to duplicate (inclusive)",
+)
+parser.add_argument(
+    "--dupe-layers-end",
+    type=int,
+    default=21,
+    help="Last decoder layer to duplicate (exclusive)",
+)
+parser.add_argument(
+    "--dupe-loops",
+    type=int,
+    default=2,
+    help="Number of extra replay passes through dupe layers",
+)
+parser.add_argument(
+    "--warmdown-ratio",
+    type=float,
+    default=None,
+    help="Override warmdown ratio (default 0.2)",
+)
+parser.add_argument(
+    "--logit-cap",
+    type=float,
+    default=10.0,
+    help="Logit soft-capping value (0=disabled)",
+)
+parser.add_argument(
+    "--logit-avg",
+    type=int,
+    default=3,
+    help="Number of late checkpoints for probability averaging (0=disabled)",
+)
+parser.add_argument(
+    "--logit-avg-dir",
+    type=str,
+    default="logit_avg_ckpts",
+    help="Directory to save/load epoch checkpoints for logit averaging",
+)
+parser.add_argument(
+    "--logit-avg-mode",
+    type=str,
+    default="both",
+    choices=["equal", "weighted", "both"],
+    help="Weight scheme: equal, linear recency weighted, or compare both",
+)
+parser.add_argument(
+    "--eval-logit-avg",
+    action="store_true",
+    help="Skip training and only run logit-avg eval on saved checkpoints",
+)
+parser.add_argument(
+    "--swa-last-epochs",
+    type=int,
+    default=3,
+    help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)",
+)
+parser.add_argument(
+    "--stoch-depth",
+    type=float,
+    default=0.05,
+    help="Stochastic depth max drop rate (linear schedule, 0=off)",
+)
+parser.add_argument(
+    "--mtp-weight",
+    type=float,
+    default=0.3,
+    help="Multi-token prediction weight (0=off)",
+)
+parser.add_argument(
+    "--iha",
+    action="store_true",
+    default=True,
+    help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)",
+)
+parser.add_argument(
+    "--no-iha", action="store_false", dest="iha", help="Disable IHA cross-head mixing"
+)
+parser.add_argument(
+    "--iha-lr", type=float, default=0.02, help="LR for IHA mixing matrices"
+)
+parser.add_argument(
+    "--no-doc-shuffle",
+    action="store_true",
+    help="Disable per-epoch document reshuffling (still shuffles batch order)",
+)
+parser.add_argument(
+    "--sequence-length",
+    type=int,
+    default=2048,
+    help="Static sequence length. Keep 2048 for benchmark runs.",
+)
+parser.add_argument(
+    "--eval-tokens", type=int, default=10_000_000, help="Validation token budget"
+)
+parser.add_argument(
+    "--compute-dtype",
+    type=str,
+    default="bfloat16",
+    choices=["bfloat16", "float32"],
+    help="Activation/matmul dtype. bfloat16 is the TPU path.",
+)
+parser.add_argument(
+    "--jax-distributed",
+    action="store_true",
+    help="Call jax.distributed.initialize() at startup for TPU multi-host jobs",
+)
+parser.add_argument(
+    "--compile-cache-dir",
+    type=str,
+    default="",
+    help="Optional JAX persistent compilation cache directory",
+)
+parser.add_argument(
+    "--log-compiles", action="store_true", help="Log JAX compilations/cache misses"
+)
+parser.add_argument(
+    "--disable-wandb", action="store_true", help="Disable WandB even on process 0"
+)
 args = parser.parse_args()
 
 if args.output_json and not args.save_result:
@@ -180,6 +262,7 @@ WD_SWA_HIGH_FACTOR = 1.50
 # Utilities
 # =============================================================================
 
+
 def is_process0() -> bool:
     return jax.process_index() == 0
 
@@ -206,6 +289,7 @@ class DummyWandb:
 
 class TeeStream:
     """Save terminal output to file."""
+
     def __init__(self, *streams):
         self.streams = streams
         self.encoding = getattr(streams[0], "encoding", "utf-8")
@@ -220,7 +304,9 @@ class TeeStream:
             stream.flush()
 
     def isatty(self):
-        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+        return any(
+            getattr(stream, "isatty", lambda: False)() for stream in self.streams
+        )
 
     def fileno(self):
         return self.streams[0].fileno()
@@ -241,7 +327,9 @@ def dtype_from_name(name: str):
     raise ValueError(f"unknown dtype {name}")
 
 
-def rms_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
+def rms_norm(
+    x: Float[Array, "... channels"], eps: float = 1e-6
+) -> Float[Array, "... channels"]:
     y = x.astype(jnp.float32)
     y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + eps)
     return y.astype(x.dtype)
@@ -251,20 +339,35 @@ def has_ve(layer_idx: int, n_layer: int) -> bool:
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
-def apply_rotary_emb(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+def apply_rotary_emb(
+    x: Float[Array, "... head_dim"],
+    cos: Float[Array, "... half_head_dim"],
+    sin: Float[Array, "... half_head_dim"],
+) -> Float[Array, "... head_dim"]:
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return jnp.concatenate([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], axis=-1)
 
 
-def precompute_rotary(seq_len: int, head_dim: int, dtype: Any, base: int = 10000) -> tuple[jax.Array, jax.Array]:
-    inv_freq = 1.0 / (base ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+def precompute_rotary(
+    seq_len: int, head_dim: int, dtype: Any, base: int = 10000
+) -> tuple[
+    Float[Array, "1 seq 1 half_head_dim"],
+    Float[Array, "1 seq 1 half_head_dim"],
+]:
+    inv_freq = 1.0 / (
+        base ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim)
+    )
     t = jnp.arange(seq_len, dtype=jnp.float32)
     freqs = jnp.outer(t, inv_freq)
-    return jnp.cos(freqs).astype(dtype)[None, :, None, :], jnp.sin(freqs).astype(dtype)[None, :, None, :]
+    return jnp.cos(freqs).astype(dtype)[None, :, None, :], jnp.sin(freqs).astype(dtype)[
+        None, :, None, :
+    ]
 
 
-def dropout(x: jax.Array, p: float, key: jax.Array, deterministic: bool) -> jax.Array:
+def dropout(
+    x: Float[Array, "..."], p: float, key: PRNGKeyArray, deterministic: bool
+) -> Float[Array, "..."]:
     if deterministic or p <= 0:
         return x
     keep_prob = 1.0 - p
@@ -273,10 +376,10 @@ def dropout(x: jax.Array, p: float, key: jax.Array, deterministic: bool) -> jax.
 
 
 def cross_entropy(
-    logits: jax.Array,
-    targets: jax.Array,
+    logits: Float[Array, "... vocab"],
+    targets: Int[Array, "..."],
     reduction: str = "mean",
-) -> jax.Array:
+) -> Float[Array, "..."]:
     log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
     safe_targets = jnp.maximum(targets, 0)
     nll = -jnp.take_along_axis(log_probs, safe_targets[..., None], axis=-1)[..., 0]
@@ -294,7 +397,9 @@ def tree_sum(tree: Any) -> int:
 
 
 def tree_zeros_like(tree: Any) -> Any:
-    return jtu.tree_map(lambda x: jnp.zeros_like(x) if isinstance(x, jax.Array) else None, tree)
+    return jtu.tree_map(
+        lambda x: jnp.zeros_like(x) if isinstance(x, jax.Array) else None, tree
+    )
 
 
 def tree_add(a: Any, b: Any) -> Any:
@@ -307,12 +412,15 @@ def tree_add(a: Any, b: Any) -> Any:
 
 
 def tree_div(a: Any, scale: float) -> Any:
-    return jtu.tree_map(lambda x: None if x is None else x / scale, a, is_leaf=lambda x: x is None)
+    return jtu.tree_map(
+        lambda x: None if x is None else x / scale, a, is_leaf=lambda x: x is None
+    )
 
 
 # =============================================================================
 # Model
 # =============================================================================
+
 
 @dataclass(frozen=True)
 class GPTConfig:
@@ -334,12 +442,22 @@ class GPTConfig:
 
 
 class Linear(eqx.Module):
-    weight: jax.Array
+    weight: Float[Array, "out_features in_features"]
 
-    def __init__(self, in_features: int, out_features: int, key: jax.Array, *, init: str, scale: float = 1.0):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        key: PRNGKeyArray,
+        *,
+        init: str,
+        scale: float = 1.0,
+    ):
         shape = (out_features, in_features)
         if init == "uniform":
-            self.weight = jax.random.uniform(key, shape, minval=-scale, maxval=scale, dtype=jnp.float32)
+            self.weight = jax.random.uniform(
+                key, shape, minval=-scale, maxval=scale, dtype=jnp.float32
+            )
         elif init == "normal":
             self.weight = scale * jax.random.normal(key, shape, dtype=jnp.float32)
         elif init == "zeros":
@@ -347,17 +465,23 @@ class Linear(eqx.Module):
         else:
             raise ValueError(f"unknown linear init {init}")
 
-    def __call__(self, x: jax.Array, dtype: Any) -> jax.Array:
+    def __call__(
+        self, x: Float[Array, "... in_features"], dtype: Any
+    ) -> Float[Array, "... out_features"]:
         return jnp.matmul(x.astype(dtype), self.weight.astype(dtype).T)
 
 
 class Embedding(eqx.Module):
-    weight: jax.Array
+    weight: Float[Array, "num_embeddings embedding_dim"]
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, key: jax.Array):
-        self.weight = jax.random.normal(key, (num_embeddings, embedding_dim), dtype=jnp.float32)
+    def __init__(self, num_embeddings: int, embedding_dim: int, key: PRNGKeyArray):
+        self.weight = jax.random.normal(
+            key, (num_embeddings, embedding_dim), dtype=jnp.float32
+        )
 
-    def __call__(self, idx: jax.Array, dtype: Any) -> jax.Array:
+    def __call__(
+        self, idx: Int[Array, "..."], dtype: Any
+    ) -> Float[Array, "... embedding_dim"]:
         return jnp.take(self.weight, idx, axis=0).astype(dtype)
 
 
@@ -368,9 +492,9 @@ class CausalSelfAttention(eqx.Module):
     c_proj: Linear
     ve_gate: Linear | None
     attn_gate: Linear
-    q_mix: jax.Array | None
-    k_mix: jax.Array | None
-    v_mix: jax.Array | None
+    q_mix: Float[Array, "head_out head_in"] | None
+    k_mix: Float[Array, "head_out head_in"] | None
+    v_mix: Float[Array, "head_out head_in"] | None
     n_head: int = eqx.field(static=True)
     n_kv_head: int = eqx.field(static=True)
     n_embd: int = eqx.field(static=True)
@@ -378,57 +502,95 @@ class CausalSelfAttention(eqx.Module):
     ve_gate_channels: int = eqx.field(static=True, default=32)
     attn_gate_channels: int = eqx.field(static=True, default=12)
 
-    def __init__(self, config: GPTConfig, layer_idx: int, key: jax.Array):
+    def __init__(self, config: GPTConfig, layer_idx: int, key: PRNGKeyArray):
         keys = jax.random.split(key, 9)
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
-        s = math.sqrt(3.0) * config.n_embd ** -0.5
-        normal_std = config.n_embd ** -0.5
-        self.c_q = Linear(config.n_embd, self.n_head * self.head_dim, keys[0], init="uniform", scale=s)
-        self.c_k = Linear(config.n_embd, self.n_kv_head * self.head_dim, keys[1], init="uniform", scale=s)
-        self.c_v = Linear(config.n_embd, self.n_kv_head * self.head_dim, keys[2], init="uniform", scale=s)
-        self.c_proj = Linear(config.n_embd, config.n_embd, keys[3], init="normal", scale=normal_std)
+        s = math.sqrt(3.0) * config.n_embd**-0.5
+        normal_std = config.n_embd**-0.5
+        self.c_q = Linear(
+            config.n_embd, self.n_head * self.head_dim, keys[0], init="uniform", scale=s
+        )
+        self.c_k = Linear(
+            config.n_embd,
+            self.n_kv_head * self.head_dim,
+            keys[1],
+            init="uniform",
+            scale=s,
+        )
+        self.c_v = Linear(
+            config.n_embd,
+            self.n_kv_head * self.head_dim,
+            keys[2],
+            init="uniform",
+            scale=s,
+        )
+        self.c_proj = Linear(
+            config.n_embd, config.n_embd, keys[3], init="normal", scale=normal_std
+        )
         self.ve_gate = (
             Linear(self.ve_gate_channels, self.n_kv_head, keys[4], init="zeros")
             if has_ve(layer_idx, config.n_layer)
             else None
         )
-        self.attn_gate = Linear(self.attn_gate_channels, self.n_head, keys[5], init="zeros")
+        self.attn_gate = Linear(
+            self.attn_gate_channels, self.n_head, keys[5], init="zeros"
+        )
         if config.use_iha:
             self.q_mix = jnp.eye(self.n_head, dtype=jnp.float32)
             self.k_mix = jnp.eye(self.n_kv_head, dtype=jnp.float32)
-            self.v_mix = jnp.eye(self.n_kv_head, dtype=jnp.float32) if config.iha_mix_v else None
+            self.v_mix = (
+                jnp.eye(self.n_kv_head, dtype=jnp.float32) if config.iha_mix_v else None
+            )
         else:
             self.q_mix = None
             self.k_mix = None
             self.v_mix = None
 
-    def _fuse_mix(self, weight: jax.Array, mix: jax.Array, heads: int) -> jax.Array:
+    def _fuse_mix(
+        self,
+        weight: Float[Array, "heads_x_dim in_dim"],
+        mix: Float[Array, "heads heads"],
+        heads: int,
+    ) -> Float[Array, "heads_x_dim in_dim"]:
         w = weight.reshape(heads, self.head_dim, -1)
         return jnp.einsum("hm,mdc->hdc", mix, w).reshape(weight.shape)
 
     def __call__(
         self,
-        x: jax.Array,
-        ve: jax.Array | None,
-        cos_sin: tuple[jax.Array, jax.Array],
+        x: Float[Array, "batch seq channels"],
+        ve: Float[Array, "batch seq kv_channels"] | None,
+        cos_sin: tuple[
+            Float[Array, "1 seq 1 half_head_dim"],
+            Float[Array, "1 seq 1 half_head_dim"],
+        ],
         window_size: int,
-        key: jax.Array,
+        key: PRNGKeyArray,
         deterministic: bool,
         config: GPTConfig,
-    ) -> jax.Array:
+    ) -> Float[Array, "batch seq channels"]:
         dtype = dtype_from_name(config.compute_dtype)
         B, T, _ = x.shape
         if self.q_mix is not None:
-            q_weight = self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head)
-            k_weight = self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head)
-            q = jnp.matmul(x.astype(dtype), q_weight.astype(dtype).T).reshape(B, T, self.n_head, self.head_dim)
-            k = jnp.matmul(x.astype(dtype), k_weight.astype(dtype).T).reshape(B, T, self.n_kv_head, self.head_dim)
-            if self.v_mix is not None:
-                v_weight = self._fuse_mix(self.c_v.weight, self.v_mix, self.n_kv_head)
-                v = jnp.matmul(x.astype(dtype), v_weight.astype(dtype).T).reshape(B, T, self.n_kv_head, self.head_dim)
+            q_mix = self.q_mix
+            k_mix = self.k_mix
+            assert k_mix is not None
+            q_weight = self._fuse_mix(self.c_q.weight, q_mix, self.n_head)
+            k_weight = self._fuse_mix(self.c_k.weight, k_mix, self.n_kv_head)
+            q = jnp.matmul(x.astype(dtype), q_weight.astype(dtype).T).reshape(
+                B, T, self.n_head, self.head_dim
+            )
+            k = jnp.matmul(x.astype(dtype), k_weight.astype(dtype).T).reshape(
+                B, T, self.n_kv_head, self.head_dim
+            )
+            v_mix = self.v_mix
+            if v_mix is not None:
+                v_weight = self._fuse_mix(self.c_v.weight, v_mix, self.n_kv_head)
+                v = jnp.matmul(x.astype(dtype), v_weight.astype(dtype).T).reshape(
+                    B, T, self.n_kv_head, self.head_dim
+                )
             else:
                 v = self.c_v(x, dtype).reshape(B, T, self.n_kv_head, self.head_dim)
         else:
@@ -437,14 +599,18 @@ class CausalSelfAttention(eqx.Module):
             v = self.c_v(x, dtype).reshape(B, T, self.n_kv_head, self.head_dim)
 
         if ve is not None:
+            ve_gate = self.ve_gate
+            assert ve_gate is not None
             ve = ve.reshape(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * jax.nn.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels], dtype))
+            gate = 2 * jax.nn.sigmoid(ve_gate(x[..., : self.ve_gate_channels], dtype))
             v = v + gate[..., None].astype(dtype) * ve
 
         cos, sin = cos_sin
         q = rms_norm(apply_rotary_emb(q, cos, sin))
         k = rms_norm(apply_rotary_emb(k, cos, sin))
-        local_window = None if window_size < 0 or window_size >= T - 1 else (window_size, 0)
+        local_window = (
+            None if window_size < 0 or window_size >= T - 1 else (window_size, 0)
+        )
         y = jax.nn.dot_product_attention(
             q,
             k,
@@ -452,7 +618,7 @@ class CausalSelfAttention(eqx.Module):
             is_causal=True,
             local_window_size=local_window,
         )
-        gate = jax.nn.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels], dtype))
+        gate = jax.nn.sigmoid(self.attn_gate(x[..., : self.attn_gate_channels], dtype))
         y = y * gate[..., None].astype(dtype)
         y = y.reshape(B, T, -1)
         y = self.c_proj(y, dtype)
@@ -464,16 +630,22 @@ class MLP(eqx.Module):
     c_fc: Linear
     c_proj: Linear
 
-    def __init__(self, config: GPTConfig, key: jax.Array):
+    def __init__(self, config: GPTConfig, key: PRNGKeyArray):
         k1, k2, k3 = jax.random.split(key, 3)
         hidden = 256 * ((8 * config.n_embd // 3 + 255) // 256)
-        s = math.sqrt(3.0) * config.n_embd ** -0.5
-        normal_std = config.n_embd ** -0.5
+        s = math.sqrt(3.0) * config.n_embd**-0.5
+        normal_std = config.n_embd**-0.5
         self.c_gate = Linear(config.n_embd, hidden, k1, init="uniform", scale=s)
         self.c_fc = Linear(config.n_embd, hidden, k2, init="uniform", scale=s)
         self.c_proj = Linear(hidden, config.n_embd, k3, init="normal", scale=normal_std)
 
-    def __call__(self, x: jax.Array, key: jax.Array, deterministic: bool, config: GPTConfig) -> jax.Array:
+    def __call__(
+        self,
+        x: Float[Array, "batch seq channels"],
+        key: PRNGKeyArray,
+        deterministic: bool,
+        config: GPTConfig,
+    ) -> Float[Array, "batch seq channels"]:
         dtype = dtype_from_name(config.compute_dtype)
         y = jax.nn.silu(self.c_gate(x, dtype)) * self.c_fc(x, dtype)
         y = self.c_proj(y, dtype)
@@ -485,7 +657,7 @@ class Block(eqx.Module):
     mlp: MLP
     drop_prob: float = eqx.field(static=True)
 
-    def __init__(self, config: GPTConfig, layer_idx: int, key: jax.Array):
+    def __init__(self, config: GPTConfig, layer_idx: int, key: PRNGKeyArray):
         k1, k2 = jax.random.split(key, 2)
         self.attn = CausalSelfAttention(config, layer_idx, k1)
         self.mlp = MLP(config, k2)
@@ -493,17 +665,22 @@ class Block(eqx.Module):
 
     def __call__(
         self,
-        x: jax.Array,
-        ve: jax.Array | None,
-        cos_sin: tuple[jax.Array, jax.Array],
+        x: Float[Array, "batch seq channels"],
+        ve: Float[Array, "batch seq kv_channels"] | None,
+        cos_sin: tuple[
+            Float[Array, "1 seq 1 half_head_dim"],
+            Float[Array, "1 seq 1 half_head_dim"],
+        ],
         window_size: int,
-        key: jax.Array,
+        key: PRNGKeyArray,
         deterministic: bool,
         config: GPTConfig,
-    ) -> jax.Array:
+    ) -> Float[Array, "batch seq channels"]:
         k_attn, k_mlp, k_depth = jax.random.split(key, 3)
         x_in = x
-        x = x + self.attn(rms_norm(x), ve, cos_sin, window_size, k_attn, deterministic, config)
+        x = x + self.attn(
+            rms_norm(x), ve, cos_sin, window_size, k_attn, deterministic, config
+        )
         x = x + self.mlp(rms_norm(x), k_mlp, deterministic, config)
         if not deterministic and self.drop_prob > 0:
             keep = (jax.random.uniform(k_depth, ()) >= self.drop_prob).astype(x.dtype)
@@ -518,27 +695,35 @@ class GPT(eqx.Module):
     wte: Embedding
     blocks: tuple[Block, ...]
     lm_head: Linear
-    resid_lambdas: jax.Array
-    x0_lambdas: jax.Array
+    resid_lambdas: Float[Array, " n_layer"]
+    x0_lambdas: Float[Array, " n_layer"]
     ve_projs: tuple[Linear | None, ...]
-    skip_weights: jax.Array
+    skip_weights: Float[Array, " encoder_layers"]
     mtp_proj: Linear | None
     mtp_block: Block | None
 
-    def __init__(self, config: GPTConfig, key: jax.Array):
+    def __init__(self, config: GPTConfig, key: PRNGKeyArray):
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
         self.encoder_layers = config.n_layer // 2
-        num_extra = 4 + config.n_layer + config.n_layer + (2 if config.mtp_weight > 0 else 0)
+        num_extra = (
+            4 + config.n_layer + config.n_layer + (2 if config.mtp_weight > 0 else 0)
+        )
         keys = iter(jax.random.split(key, num_extra))
         self.wte = Embedding(config.padded_vocab_size, config.n_embd, next(keys))
         self.blocks = tuple(Block(config, i, next(keys)) for i in range(config.n_layer))
-        self.lm_head = Linear(config.n_embd, config.padded_vocab_size, next(keys), init="normal", scale=0.001)
+        self.lm_head = Linear(
+            config.n_embd,
+            config.padded_vocab_size,
+            next(keys),
+            init="normal",
+            scale=0.001,
+        )
         self.resid_lambdas = jnp.ones((config.n_layer,), dtype=jnp.float32)
         self.x0_lambdas = jnp.full((config.n_layer,), 0.1, dtype=jnp.float32)
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        s = math.sqrt(3.0) * config.n_embd ** -0.5
+        s = math.sqrt(3.0) * config.n_embd**-0.5
         self.ve_projs = tuple(
             Linear(config.n_embd, kv_dim, next(keys), init="uniform", scale=s)
             if has_ve(i, config.n_layer)
@@ -547,7 +732,9 @@ class GPT(eqx.Module):
         )
         self.skip_weights = jnp.ones((self.encoder_layers,), dtype=jnp.float32)
         if config.mtp_weight > 0:
-            self.mtp_proj = Linear(2 * config.n_embd, config.n_embd, next(keys), init="uniform", scale=s)
+            self.mtp_proj = Linear(
+                2 * config.n_embd, config.n_embd, next(keys), init="uniform", scale=s
+            )
             self.mtp_block = Block(config, config.n_layer, next(keys))
         else:
             self.mtp_proj = None
@@ -561,39 +748,52 @@ class GPT(eqx.Module):
         sizes[-1] = long_w
         return tuple(sizes)
 
-    def _next_key(self, key: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def _next_key(self, key: PRNGKeyArray) -> tuple[PRNGKeyArray, PRNGKeyArray]:
         key, subkey = jax.random.split(key)
         return key, subkey
 
     def _run_decoder_layers(
         self,
-        x: jax.Array,
-        x0: jax.Array,
-        encoder_outputs: list[jax.Array],
-        cos_sin: tuple[jax.Array, jax.Array],
+        x: Float[Array, "batch seq channels"],
+        x0: Float[Array, "batch seq channels"],
+        encoder_outputs: list[Float[Array, "batch seq channels"]],
+        cos_sin: tuple[
+            Float[Array, "1 seq 1 half_head_dim"],
+            Float[Array, "1 seq 1 half_head_dim"],
+        ],
         start: int,
         end: int,
-        key: jax.Array,
+        key: PRNGKeyArray,
         deterministic: bool,
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> tuple[Float[Array, "batch seq channels"], PRNGKeyArray]:
         dtype = dtype_from_name(self.config.compute_dtype)
         for i in range(start, end):
             j = self.config.n_layer - 1 - i
             if 0 <= j < self.encoder_layers:
-                x = x + self.skip_weights[i - self.encoder_layers].astype(dtype) * encoder_outputs[j]
-            x = self.resid_lambdas[i].astype(dtype) * x + self.x0_lambdas[i].astype(dtype) * x0
-            ve = self.ve_projs[i](x0, dtype) if self.ve_projs[i] is not None else None
+                x = (
+                    x
+                    + self.skip_weights[i - self.encoder_layers].astype(dtype)
+                    * encoder_outputs[j]
+                )
+            x = (
+                self.resid_lambdas[i].astype(dtype) * x
+                + self.x0_lambdas[i].astype(dtype) * x0
+            )
+            ve_proj = self.ve_projs[i]
+            ve = ve_proj(x0, dtype) if ve_proj is not None else None
             key, subkey = self._next_key(key)
-            x = self.blocks[i](x, ve, cos_sin, self.window_sizes[i], subkey, deterministic, self.config)
+            x = self.blocks[i](
+                x, ve, cos_sin, self.window_sizes[i], subkey, deterministic, self.config
+            )
         return x, key
 
     def __call__(
         self,
-        idx: jax.Array,
-        targets: jax.Array | None = None,
+        idx: Int[Array, "batch seq"],
+        targets: Int[Array, "batch seq"] | None = None,
         *,
         loss_reduction: str = "mean",
-        key: jax.Array,
+        key: PRNGKeyArray,
         deterministic: bool,
         dupe_enabled: bool,
         dupe_start: int,
@@ -606,32 +806,68 @@ class GPT(eqx.Module):
         x = rms_norm(self.wte(idx, dtype))
         x0 = x
 
-        encoder_outputs: list[jax.Array] = []
+        encoder_outputs: list[Float[Array, "batch seq channels"]] = []
         for i in range(self.encoder_layers):
-            x = self.resid_lambdas[i].astype(dtype) * x + self.x0_lambdas[i].astype(dtype) * x0
-            ve = self.ve_projs[i](x0, dtype) if self.ve_projs[i] is not None else None
+            x = (
+                self.resid_lambdas[i].astype(dtype) * x
+                + self.x0_lambdas[i].astype(dtype) * x0
+            )
+            ve_proj = self.ve_projs[i]
+            ve = ve_proj(x0, dtype) if ve_proj is not None else None
             key, subkey = self._next_key(key)
-            x = self.blocks[i](x, ve, cos_sin, self.window_sizes[i], subkey, deterministic, self.config)
+            x = self.blocks[i](
+                x, ve, cos_sin, self.window_sizes[i], subkey, deterministic, self.config
+            )
             encoder_outputs.append(x)
 
         if not dupe_enabled:
             x, key = self._run_decoder_layers(
-                x, x0, encoder_outputs, cos_sin, self.encoder_layers, self.config.n_layer, key, deterministic
+                x,
+                x0,
+                encoder_outputs,
+                cos_sin,
+                self.encoder_layers,
+                self.config.n_layer,
+                key,
+                deterministic,
             )
         else:
             x, key = self._run_decoder_layers(
-                x, x0, encoder_outputs, cos_sin, self.encoder_layers, dupe_end, key, deterministic
+                x,
+                x0,
+                encoder_outputs,
+                cos_sin,
+                self.encoder_layers,
+                dupe_end,
+                key,
+                deterministic,
             )
             for _ in range(dupe_loops):
                 x, key = self._run_decoder_layers(
-                    x, x0, encoder_outputs, cos_sin, dupe_start, dupe_end, key, deterministic
+                    x,
+                    x0,
+                    encoder_outputs,
+                    cos_sin,
+                    dupe_start,
+                    dupe_end,
+                    key,
+                    deterministic,
                 )
             x, key = self._run_decoder_layers(
-                x, x0, encoder_outputs, cos_sin, dupe_end, self.config.n_layer, key, deterministic
+                x,
+                x0,
+                encoder_outputs,
+                cos_sin,
+                dupe_end,
+                self.config.n_layer,
+                key,
+                deterministic,
             )
 
         x = rms_norm(x)
-        logits = self.lm_head(x, dtype)[..., :self.config.vocab_size].astype(jnp.float32)
+        logits = self.lm_head(x, dtype)[..., : self.config.vocab_size].astype(
+            jnp.float32
+        )
         if self.config.logit_cap > 0:
             logits = self.config.logit_cap * jnp.tanh(logits / self.config.logit_cap)
         if targets is None:
@@ -645,14 +881,26 @@ class GPT(eqx.Module):
             return lm_loss, {"lm_loss": lm_loss, "mtp_loss": zero}
 
         mtp_emb = rms_norm(self.wte(jnp.maximum(targets[:, :-1], 0), dtype))
-        combined = self.mtp_proj(jnp.concatenate([x[:, :-1], mtp_emb], axis=-1), dtype)
+        mtp_proj = self.mtp_proj
+        mtp_block = self.mtp_block
+        assert mtp_proj is not None
+        assert mtp_block is not None
+        combined = mtp_proj(jnp.concatenate([x[:, :-1], mtp_emb], axis=-1), dtype)
         mT = combined.shape[1]
-        mtp_cos_sin = precompute_rotary(mT, self.config.n_embd // self.config.n_head, dtype)
+        mtp_cos_sin = precompute_rotary(
+            mT, self.config.n_embd // self.config.n_head, dtype
+        )
         key, subkey = self._next_key(key)
-        mtp_out = rms_norm(self.mtp_block(combined, None, mtp_cos_sin, -1, subkey, deterministic, self.config))
-        mtp_logits = self.lm_head(mtp_out, dtype)[..., :self.config.vocab_size].astype(jnp.float32)
+        mtp_out = rms_norm(
+            mtp_block(combined, None, mtp_cos_sin, -1, subkey, deterministic, self.config)
+        )
+        mtp_logits = self.lm_head(mtp_out, dtype)[..., : self.config.vocab_size].astype(
+            jnp.float32
+        )
         if self.config.logit_cap > 0:
-            mtp_logits = self.config.logit_cap * jnp.tanh(mtp_logits / self.config.logit_cap)
+            mtp_logits = self.config.logit_cap * jnp.tanh(
+                mtp_logits / self.config.logit_cap
+            )
         mtp_loss = cross_entropy(mtp_logits, targets[:, 1:], reduction="mean")
         loss = lm_loss + self.config.mtp_weight * mtp_loss
         return loss, {"lm_loss": lm_loss, "mtp_loss": mtp_loss}
@@ -664,8 +912,14 @@ class GPT(eqx.Module):
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
     def estimate_flops(self, nparams: int) -> float:
-        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w, t) for w in self.window_sizes)
+        h, q, t = (
+            self.config.n_head,
+            self.config.n_embd // self.config.n_head,
+            self.config.sequence_len,
+        )
+        attn_flops = sum(
+            12 * h * q * self._avg_causal_attended_keys(w, t) for w in self.window_sizes
+        )
         return 6 * nparams + attn_flops
 
 
@@ -695,26 +949,26 @@ class ParamSpec:
 
 @dataclass(frozen=True)
 class LeafUpdate:
-    param: Any
-    adam_m: Any
-    adam_v: Any
-    muon_m: Any
-    muon_v: Any
+    param: Float[Array, "..."] | None
+    adam_m: Float[Array, "..."] | None
+    adam_v: Float[Array, "..."] | None
+    muon_m: Float[Array, "..."] | None
+    muon_v: Float[Array, "..."] | None
 
 
 class OptimizerState(NamedTuple):
-    step: jax.Array
-    adam_m: Any
-    adam_v: Any
-    muon_m: Any
-    muon_v: Any
+    step: Int[Array, ""]
+    adam_m: PyTree[Float[Array, "..."] | None]
+    adam_v: PyTree[Float[Array, "..."] | None]
+    muon_m: PyTree[Float[Array, "..."] | None]
+    muon_v: PyTree[Float[Array, "..."] | None]
 
 
 class TrainState(NamedTuple):
-    params: Any
+    params: PyTree[Float[Array, "..."]]
     opt_state: OptimizerState
-    key: jax.Array
-    step: jax.Array
+    key: PRNGKeyArray
+    step: Int[Array, ""]
 
 
 def _path_to_str(path: tuple[Any, ...]) -> str:
@@ -731,23 +985,40 @@ def _path_to_str(path: tuple[Any, ...]) -> str:
     return ".".join(parts)
 
 
-def build_optimizer_spec(params: Any) -> Any:
+def build_optimizer_spec(
+    params: PyTree[Float[Array, "..."]],
+) -> PyTree[ParamSpec | None]:
     def make_spec(path: tuple[Any, ...], p: Any):
         if p is None:
             return None
         name = _path_to_str(path)
         if name.endswith("lm_head.weight"):
-            return ParamSpec("adamw", UNEMBEDDING_LR, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, WEIGHT_DECAY)
+            return ParamSpec(
+                "adamw",
+                UNEMBEDDING_LR,
+                ADAM_BETAS[0],
+                ADAM_BETAS[1],
+                1e-10,
+                WEIGHT_DECAY,
+            )
         if name.endswith("wte.weight"):
-            return ParamSpec("adamw", EMBEDDING_LR, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, WEIGHT_DECAY)
+            return ParamSpec(
+                "adamw", EMBEDDING_LR, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, WEIGHT_DECAY
+            )
         if name.endswith("resid_lambdas"):
-            return ParamSpec("adamw", SCALAR_LR * 0.01, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, 0.0)
+            return ParamSpec(
+                "adamw", SCALAR_LR * 0.01, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, 0.0
+            )
         if name.endswith("x0_lambdas"):
             return ParamSpec("adamw", SCALAR_LR, 0.96, 0.95, 1e-10, 0.0)
         if name.endswith("skip_weights"):
-            return ParamSpec("adamw", SCALAR_LR * 0.01, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, 0.0)
+            return ParamSpec(
+                "adamw", SCALAR_LR * 0.01, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, 0.0
+            )
         if name.endswith(("q_mix", "k_mix", "v_mix")):
-            return ParamSpec("adamw", args.iha_lr, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, 0.0)
+            return ParamSpec(
+                "adamw", args.iha_lr, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, 0.0
+            )
         if getattr(p, "ndim", 0) == 2:
             return ParamSpec("muon", MATRIX_LR, 0.95, 0.95, 1e-10, WEIGHT_DECAY)
         return ParamSpec("adamw", SCALAR_LR, ADAM_BETAS[0], ADAM_BETAS[1], 1e-10, 0.0)
@@ -755,7 +1026,9 @@ def build_optimizer_spec(params: Any) -> Any:
     return jtu.tree_map_with_path(make_spec, params, is_leaf=lambda x: x is None)
 
 
-def init_optimizer_state(params: Any, specs: Any) -> OptimizerState:
+def init_optimizer_state(
+    params: PyTree[Float[Array, "..."]], specs: PyTree[ParamSpec | None]
+) -> OptimizerState:
     def adam_state(p, spec):
         if p is None or spec is None or spec.kind != "adamw":
             return None
@@ -786,15 +1059,15 @@ def init_optimizer_state(params: Any, specs: Any) -> OptimizerState:
 
 
 def _adamw_update(
-    p: jax.Array,
-    g: jax.Array,
-    m: jax.Array,
-    v: jax.Array,
-    step: jax.Array,
+    p: Float[Array, "..."],
+    g: Float[Array, "..."],
+    m: Float[Array, "..."],
+    v: Float[Array, "..."],
+    step: Int[Array, ""],
     spec: ParamSpec,
-    lr_mult: jax.Array,
-    wd_mult: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    lr_mult: Float[Array, ""],
+    wd_mult: Float[Array, ""],
+) -> tuple[Float[Array, "..."], Float[Array, "..."], Float[Array, "..."]]:
     lr = jnp.asarray(spec.lr, jnp.float32) * lr_mult
     wd = jnp.asarray(spec.weight_decay, jnp.float32) * wd_mult
     beta1 = jnp.asarray(spec.beta1, jnp.float32)
@@ -810,29 +1083,35 @@ def _adamw_update(
 
 
 def _muon_update(
-    p: jax.Array,
-    g: jax.Array,
-    momentum_buffer: jax.Array,
-    second_momentum_buffer: jax.Array,
+    p: Float[Array, "..."],
+    g: Float[Array, "..."],
+    momentum_buffer: Float[Array, "..."],
+    second_momentum_buffer: Float[Array, "..."],
     spec: ParamSpec,
-    lr_mult: jax.Array,
-    wd_mult: jax.Array,
-    muon_momentum: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    lr_mult: Float[Array, ""],
+    wd_mult: Float[Array, ""],
+    muon_momentum: Float[Array, ""],
+) -> tuple[Float[Array, "..."], Float[Array, "..."], Float[Array, "..."]]:
     g = g.astype(jnp.float32)
     momentum = muon_momentum.astype(jnp.float32)
     momentum_buffer = momentum * momentum_buffer + (1.0 - momentum) * g
     g = (1.0 - momentum) * g + momentum * momentum_buffer
     g = g / jnp.maximum(jnp.linalg.norm(g, axis=-1, keepdims=True), 1e-7)
     X = g.astype(jnp.bfloat16)
-    X = X / (jnp.linalg.norm(X.astype(jnp.float32), axis=(-2, -1), keepdims=True).astype(X.dtype) * 1.02 + 1e-6)
+    X = X / (
+        jnp.linalg.norm(X.astype(jnp.float32), axis=(-2, -1), keepdims=True).astype(
+            X.dtype
+        )
+        * 1.02
+        + 1e-6
+    )
 
     if g.shape[-2] > g.shape[-1]:
-        for a, b, c in polar_express_coeffs[:spec.ns_steps]:
+        for a, b, c in polar_express_coeffs[: spec.ns_steps]:
             A = jnp.swapaxes(X, -1, -2) @ X
             X = a * X + X @ (b * A + c * (A @ A))
     else:
-        for a, b, c in polar_express_coeffs[:spec.ns_steps]:
+        for a, b, c in polar_express_coeffs[: spec.ns_steps]:
             A = X @ jnp.swapaxes(X, -1, -2)
             X = a * X + (b * A + c * (A @ A)) @ X
     g = X.astype(jnp.float32)
@@ -859,14 +1138,14 @@ def _muon_update(
 
 
 def optimizer_update(
-    params: Any,
-    grads: Any,
+    params: PyTree[Float[Array, "..."]],
+    grads: PyTree[Float[Array, "..."] | None],
     state: OptimizerState,
-    specs: Any,
-    lr_mult: jax.Array,
-    wd_mult: jax.Array,
-    muon_momentum: jax.Array,
-) -> tuple[Any, OptimizerState]:
+    specs: PyTree[ParamSpec | None],
+    lr_mult: Float[Array, ""],
+    wd_mult: Float[Array, ""],
+    muon_momentum: Float[Array, ""],
+) -> tuple[PyTree[Float[Array, "..."]], OptimizerState]:
     step = state.step + 1
 
     def update_one(p, g, am, av, mm, mv, spec):
@@ -893,6 +1172,7 @@ def optimizer_update(
         specs,
         is_leaf=is_leaf,
     )
+
     def upd_leaf(x):
         return isinstance(x, LeafUpdate)
 
@@ -911,6 +1191,7 @@ def optimizer_update(
 # Dataloader: BOS-aligned best-fit packing
 # =============================================================================
 
+
 def load_token_file(filepath: str) -> dict[str, Any]:
     if filepath.endswith(".npz"):
         data = np.load(filepath)
@@ -921,7 +1202,9 @@ def load_token_file(filepath: str) -> dict[str, Any]:
             "seq_shuffle_seed": int(data["seq_shuffle_seed"]),
         }
     if torch is None:
-        raise RuntimeError("Torch is required to read .pt data files. Use .npz data or install torch.")
+        raise RuntimeError(
+            "Torch is required to read .pt data files. Use .npz data or install torch."
+        )
     data = torch.load(filepath, map_location="cpu", weights_only=True)
     return {
         "tokens": data["tokens"].cpu().numpy(),
@@ -934,15 +1217,26 @@ def load_token_file(filepath: str) -> dict[str, Any]:
 class DataLoader:
     """Loads flat tokens, chunks into fixed sequences, then shards by JAX process."""
 
-    def __init__(self, filepath: str, per_process_batch: int, T: int, *, doc_shuffle: bool = False):
+    def __init__(
+        self,
+        filepath: str,
+        per_process_batch: int,
+        T: int,
+        *,
+        doc_shuffle: bool = False,
+    ):
         data = load_token_file(filepath)
         all_tokens = np.asarray(data["tokens"], dtype=np.int32)
         raw_doc_starts = np.asarray(data["doc_starts"], dtype=np.int64)
         bos_id = int(data["bos_id"])
         assert bos_id == BOS_ID, f"data bos_id {bos_id} != expected {BOS_ID}"
 
-        doc_ends = np.concatenate([raw_doc_starts[1:], np.asarray([all_tokens.size], dtype=np.int64)])
-        self.doc_tokens = [all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())]
+        doc_ends = np.concatenate(
+            [raw_doc_starts[1:], np.asarray([all_tokens.size], dtype=np.int64)]
+        )
+        self.doc_tokens = [
+            all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())
+        ]
         self.default_shuffle_seed = int(data["seq_shuffle_seed"])
         self.process_index = jax.process_index()
         self.process_count = jax.process_count()
@@ -956,12 +1250,14 @@ class DataLoader:
     def _build_batches(self) -> None:
         tokens = np.concatenate(self.doc_tokens)
         num_seqs = len(tokens) // self.seq_size
-        all_seqs = tokens[:num_seqs * self.seq_size].reshape(num_seqs, self.seq_size)
+        all_seqs = tokens[: num_seqs * self.seq_size].reshape(num_seqs, self.seq_size)
         if self.doc_shuffle:
             rng = np.random.RandomState(self.epoch + 1000)
             all_seqs = all_seqs[rng.permutation(num_seqs)]
         else:
-            perm = np.random.RandomState(self.default_shuffle_seed).permutation(num_seqs)
+            perm = np.random.RandomState(self.default_shuffle_seed).permutation(
+                num_seqs
+            )
             all_seqs = all_seqs[perm]
         seqs_per_step = self.B * self.process_count
         num_steps = len(all_seqs) // seqs_per_step
@@ -970,7 +1266,9 @@ class DataLoader:
             raise ValueError(
                 f"{self.B=} and process_count={self.process_count} leave no full batches in {num_seqs} sequences"
             )
-        all_seqs = all_seqs[:usable].reshape(num_steps, self.process_count, self.B, self.seq_size)
+        all_seqs = all_seqs[:usable].reshape(
+            num_steps, self.process_count, self.B, self.seq_size
+        )
         self.rank_data = np.ascontiguousarray(all_seqs[:, self.process_index])
         self.num_steps = num_steps
         self.total_tokens = usable * self.T
@@ -990,7 +1288,9 @@ class DataLoader:
         else:
             self.pos = 0
             rng = np.random.RandomState(self.epoch)
-            self.rank_data = np.ascontiguousarray(self.rank_data[rng.permutation(self.num_steps)])
+            self.rank_data = np.ascontiguousarray(
+                self.rank_data[rng.permutation(self.num_steps)]
+            )
 
     def __next__(self) -> tuple[np.ndarray, np.ndarray, int]:
         if self.pos >= self.num_steps:
@@ -1004,7 +1304,9 @@ class DataLoader:
         )
 
 
-def next_microbatches(loader: DataLoader, grad_accum_steps: int) -> tuple[np.ndarray, np.ndarray, int]:
+def next_microbatches(
+    loader: DataLoader, grad_accum_steps: int
+) -> tuple[np.ndarray, np.ndarray, int]:
     xs, ys = [], []
     epoch = loader.epoch
     for _ in range(grad_accum_steps):
@@ -1018,15 +1320,21 @@ def next_microbatches(loader: DataLoader, grad_accum_steps: int) -> tuple[np.nda
 # JIT step factories
 # =============================================================================
 
+
 def make_train_step(
     model_static: GPT,
-    opt_specs: Any,
+    opt_specs: PyTree[ParamSpec | None],
     grad_accum_steps: int,
     microbatch_sharding: NamedSharding,
     dupe_enabled: bool,
 ):
     @eqx.filter_value_and_grad(has_aux=True)
-    def loss_fn(params, x, y, key):
+    def loss_fn(
+        params: PyTree[Float[Array, "..."]],
+        x: Int[Array, "batch seq"],
+        y: Int[Array, "batch seq"],
+        key: PRNGKeyArray,
+    ) -> tuple[Float[Array, ""], dict[str, Float[Array, ""]]]:
         model = eqx.combine(params, model_static)
         loss, metrics = model(
             x,
@@ -1043,12 +1351,12 @@ def make_train_step(
     @eqx.filter_jit(donate="all")
     def train_step(
         state: TrainState,
-        xs: jax.Array,
-        ys: jax.Array,
-        lr_mult: jax.Array,
-        wd_mult: jax.Array,
-        muon_momentum: jax.Array,
-    ) -> tuple[TrainState, dict[str, jax.Array]]:
+        xs: Int[Array, "microbatch batch seq"],
+        ys: Int[Array, "microbatch batch seq"],
+        lr_mult: Float[Array, ""],
+        wd_mult: Float[Array, ""],
+        muon_momentum: Float[Array, ""],
+    ) -> tuple[TrainState, dict[str, Float[Array, ""]]]:
         xs = jax.lax.with_sharding_constraint(xs, microbatch_sharding)
         ys = jax.lax.with_sharding_constraint(ys, microbatch_sharding)
         zero_grads = tree_zeros_like(state.params)
@@ -1097,7 +1405,12 @@ def make_train_step(
 
 def make_eval_step(model_static: GPT, batch_sharding: NamedSharding, dupe_enabled: bool):
     @eqx.filter_jit
-    def eval_step(params, x: jax.Array, y: jax.Array, token_bytes: jax.Array):
+    def eval_step(
+        params: PyTree[Float[Array, "..."]],
+        x: Int[Array, "batch seq"],
+        y: Int[Array, "batch seq"],
+        token_bytes: Int[Array, " vocab"],
+    ) -> tuple[Float[Array, ""], Int[Array, ""], Float[Array, ""], Int[Array, ""]]:
         x = jax.lax.with_sharding_constraint(x, batch_sharding)
         y = jax.lax.with_sharding_constraint(y, batch_sharding)
         model = eqx.combine(params, model_static)
@@ -1105,7 +1418,7 @@ def make_eval_step(model_static: GPT, batch_sharding: NamedSharding, dupe_enable
             x,
             y,
             loss_reduction="none",
-            key=jax.random.PRNGKey(0),
+            key=jax.random.key(0),
             deterministic=True,
             dupe_enabled=dupe_enabled,
             dupe_start=args.dupe_layers_start,
@@ -1123,15 +1436,21 @@ def make_eval_step(model_static: GPT, batch_sharding: NamedSharding, dupe_enable
     return eval_step
 
 
-def make_target_prob_step(model_static: GPT, batch_sharding: NamedSharding, dupe_enabled: bool):
+def make_target_prob_step(
+    model_static: GPT, batch_sharding: NamedSharding, dupe_enabled: bool
+):
     @eqx.filter_jit
-    def target_prob_step(params, x: jax.Array, y: jax.Array):
+    def target_prob_step(
+        params: PyTree[Float[Array, "..."]],
+        x: Int[Array, "batch seq"],
+        y: Int[Array, "batch seq"],
+    ) -> Float[Array, " tokens"]:
         x = jax.lax.with_sharding_constraint(x, batch_sharding)
         y = jax.lax.with_sharding_constraint(y, batch_sharding)
         model = eqx.combine(params, model_static)
         logits = model(
             x,
-            key=jax.random.PRNGKey(0),
+            key=jax.random.key(0),
             deterministic=True,
             dupe_enabled=dupe_enabled,
             dupe_start=args.dupe_layers_start,
@@ -1150,28 +1469,39 @@ def make_target_prob_step(model_static: GPT, batch_sharding: NamedSharding, dupe
 # Training/evaluation helpers
 # =============================================================================
 
-def make_global_array(local: np.ndarray, sharding: NamedSharding, global_shape: tuple[int, ...]) -> jax.Array:
-    return jax.make_array_from_process_local_data(sharding, local, global_shape=global_shape)
+
+def make_global_array(
+    local: np.ndarray, sharding: NamedSharding, global_shape: tuple[int, ...]
+) -> Array:
+    return jax.make_array_from_process_local_data(
+        sharding, local, global_shape=global_shape
+    )
 
 
 def evaluate_bpb(
-    params: Any,
+    params: PyTree[Float[Array, "..."]],
     build_val_loader,
     steps: int,
-    token_bytes: jax.Array,
+    token_bytes: Int[Array, " vocab"],
     eval_step,
     batch_sharding: NamedSharding,
     global_batch_size: int,
 ) -> tuple[float, float]:
     val_loader = build_val_loader()
-    totals = None
+    totals: (
+        tuple[Float[Array, ""], Int[Array, ""], Float[Array, ""], Int[Array, ""]]
+        | None
+    ) = None
     for _ in range(steps):
         x, y, _ = next(val_loader)
         xg = make_global_array(x, batch_sharding, (global_batch_size, MAX_SEQ_LEN))
         yg = make_global_array(y, batch_sharding, (global_batch_size, MAX_SEQ_LEN))
         out = eval_step(params, xg, yg, token_bytes)
         totals = out if totals is None else tuple(a + b for a, b in zip(totals, out))
-    total_nats, total_bytes, total_loss, total_tokens = [np.asarray(jax.device_get(x)) for x in totals]
+    assert totals is not None
+    total_nats, total_bytes, total_loss, total_tokens = [
+        np.asarray(jax.device_get(x)) for x in totals
+    ]
     total_nats = float(total_nats)
     total_bytes = int(total_bytes)
     total_loss = float(total_loss)
@@ -1183,19 +1513,19 @@ def evaluate_bpb(
 
 def evaluate_bpb_logit_avg(
     model_static: GPT,
-    params_skeleton: Any,
+    params_skeleton: PyTree[Float[Array, "..."]],
     ckpt_paths: list[str],
     weights: list[float],
     build_val_loader,
     steps: int,
-    token_bytes: jax.Array,
+    token_bytes: Int[Array, " vocab"],
     target_prob_step,
     batch_sharding: NamedSharding,
     global_batch_size: int,
 ) -> tuple[float, float]:
     val_loader = build_val_loader()
     batches = [next(val_loader)[:2] for _ in range(steps)]
-    accum_probs = [None for _ in range(steps)]
+    accum_probs: list[Float[Array, " tokens"] | None] = [None for _ in range(steps)]
 
     for path, w in zip(ckpt_paths, weights):
         params = eqx.tree_deserialise_leaves(path, params_skeleton)
@@ -1210,6 +1540,7 @@ def evaluate_bpb_logit_avg(
     total_bytes = jnp.asarray(0, dtype=jnp.int32)
     total_tokens = jnp.asarray(0, dtype=jnp.int32)
     for probs, (_, y) in zip(accum_probs, batches):
+        assert probs is not None
         yg = make_global_array(y, batch_sharding, (global_batch_size, MAX_SEQ_LEN))
         flat_y = yg.reshape(-1)
         mask = flat_y != -1
@@ -1221,14 +1552,21 @@ def evaluate_bpb_logit_avg(
         total_tokens += jnp.sum(mask, dtype=jnp.int32)
 
     total_nats, total_bytes, total_loss, total_tokens = [
-        np.asarray(jax.device_get(x)) for x in (total_nats, total_bytes, total_loss, total_tokens)
+        np.asarray(jax.device_get(x))
+        for x in (total_nats, total_bytes, total_loss, total_tokens)
     ]
-    bpb = float(total_nats) / (math.log(2) * int(total_bytes)) if int(total_bytes) > 0 else float("inf")
-    loss = float(total_loss) / int(total_tokens) if int(total_tokens) > 0 else float("inf")
+    bpb = (
+        float(total_nats) / (math.log(2) * int(total_bytes))
+        if int(total_bytes) > 0
+        else float("inf")
+    )
+    loss = (
+        float(total_loss) / int(total_tokens) if int(total_tokens) > 0 else float("inf")
+    )
     return bpb, loss
 
 
-def save_params(path: str, params: Any) -> None:
+def save_params(path: str, params: PyTree[Float[Array, "..."]]) -> None:
     if is_process0():
         eqx.tree_serialise_leaves(path, params)
 
@@ -1255,25 +1593,43 @@ if master_process:
     sys.stdout = TeeStream(sys.stdout, artifacts_log_f)
     sys.stderr = TeeStream(sys.stderr, artifacts_log_f)
 
-_wandb_kwargs = {"project": "slowrun", "name": run_name, "dir": os.path.join(run_dir, "wandb")}
+_wandb_kwargs: dict[str, Any] = {
+    "project": "slowrun",
+    "name": run_name,
+    "dir": os.path.join(run_dir, "wandb"),
+}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
-wandb_run = DummyWandb() if (not master_process or args.disable_wandb) else wandb.init(**_wandb_kwargs)
+wandb_run = (
+    DummyWandb()
+    if (not master_process or args.disable_wandb)
+    else wandb.init(**_wandb_kwargs)
+)
 if master_process and not args.disable_wandb:
     wandb_run.log_code(".")
 
 print0("--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
-print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}, compute_dtype={args.compute_dtype}")
+print0(
+    f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}, compute_dtype={args.compute_dtype}"
+)
 print0(f"  stoch_depth={args.stoch_depth}")
-print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
-print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
+print0(
+    f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}"
+)
+print0(
+    f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}"
+)
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
-print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
+print0(
+    f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}"
+)
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
 print0(f"  iha={args.iha}, iha_lr={args.iha_lr}")
-print0(f"  jax_processes={jax.process_count()}, local_devices={jax.local_device_count()}, devices={jax.device_count()}")
+print0(
+    f"  jax_processes={jax.process_count()}, local_devices={jax.local_device_count()}, devices={jax.device_count()}"
+)
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0("-----------------------")
@@ -1286,7 +1642,9 @@ print0(f"Vocab size: {vocab_size:,} (padded to {padded_vocab:,})")
 eot_id = encoder._special_tokens["<|endoftext|>"]
 token_bytes_list = []
 for i in range(vocab_size):
-    token_bytes_list.append(0 if i == eot_id else len(encoder.decode_single_token_bytes(i)))
+    token_bytes_list.append(
+        0 if i == eot_id else len(encoder.decode_single_token_bytes(i))
+    )
 token_bytes_np = np.asarray(token_bytes_list, dtype=np.int32)
 
 config = GPTConfig(
@@ -1307,14 +1665,16 @@ config = GPTConfig(
     compute_dtype=args.compute_dtype,
 )
 
-dupe_can_activate = (not args.eval_logit_avg) and args.dupe_start_epoch <= args.num_epochs
+dupe_can_activate = (
+    not args.eval_logit_avg
+) and args.dupe_start_epoch <= args.num_epochs
 if dupe_can_activate:
     if args.dupe_layers_start < config.n_layer // 2:
         raise ValueError("dupe layers must be decoder-only")
     if args.dupe_layers_end > config.n_layer:
         raise ValueError("dupe_layers_end exceeds n_layer")
 
-model_key, train_key = jax.random.split(jax.random.PRNGKey(42))
+model_key, train_key = jax.random.split(jax.random.key(42))
 model = GPT(config, model_key)
 params, model_static = eqx.partition(model, eqx.is_inexact_array)
 opt_specs = build_optimizer_spec(params)
@@ -1342,9 +1702,17 @@ assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0, (
 )
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-_train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
-_val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, per_process_batch, MAX_SEQ_LEN, doc_shuffle=not args.no_doc_shuffle)
+_train_path = (
+    args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
+)
+_val_path = (
+    args.input_val_bin
+    if args.input_val_bin
+    else os.path.join(DATA_DIR, "fineweb_val.pt")
+)
+train_loader = DataLoader(
+    _train_path, per_process_batch, MAX_SEQ_LEN, doc_shuffle=not args.no_doc_shuffle
+)
 
 
 def build_val_loader():
@@ -1354,7 +1722,11 @@ def build_val_loader():
 TOKENS_PER_EPOCH = train_loader.total_tokens
 num_iterations = max(1, round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE))
 steps_per_epoch = num_iterations / args.num_epochs
-_swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
+_swa_start_step = (
+    (num_iterations - args.swa_last_epochs * steps_per_epoch)
+    if args.swa_last_epochs > 0
+    else -1
+)
 eval_steps = max(1, EVAL_TOKENS // (tokens_per_fwdbwd))
 
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
@@ -1370,7 +1742,7 @@ def get_lr_multiplier(it: int) -> float:
     if warmdown <= 0 or it <= num_iterations - warmdown:
         return 1.0
     progress = max(num_iterations - it, 0) / warmdown
-    shaped = progress ** WARMDOWN_POWER
+    shaped = progress**WARMDOWN_POWER
     return shaped + (1 - shaped) * FINAL_LR_FRAC
 
 
@@ -1394,7 +1766,9 @@ def get_wd_multiplier(it: int) -> float:
 
 
 dupe_active = False
-train_step = make_train_step(model_static, opt_specs, grad_accum_steps, microbatch_sharding, dupe_active)
+train_step = make_train_step(
+    model_static, opt_specs, grad_accum_steps, microbatch_sharding, dupe_active
+)
 eval_step = make_eval_step(model_static, batch_sharding, dupe_active)
 target_prob_step = make_target_prob_step(model_static, batch_sharding, dupe_active)
 
@@ -1414,7 +1788,9 @@ logit_avg_count = args.logit_avg
 if logit_avg_count > 0 and master_process:
     os.makedirs(args.logit_avg_dir, exist_ok=True)
 if logit_avg_count > 0:
-    print0(f"Logit averaging: saving last {logit_avg_count} epoch checkpoints to {args.logit_avg_dir}/")
+    print0(
+        f"Logit averaging: saving last {logit_avg_count} epoch checkpoints to {args.logit_avg_dir}/"
+    )
 
 if args.eval_logit_avg:
     print0("--eval-logit-avg set: skipping training, loading checkpoints from disk.")
@@ -1437,22 +1813,39 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     if not dupe_active and current_epoch >= args.dupe_start_epoch:
         print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
         dupe_active = True
-        train_step = make_train_step(model_static, opt_specs, grad_accum_steps, microbatch_sharding, dupe_active)
+        train_step = make_train_step(
+            model_static, opt_specs, grad_accum_steps, microbatch_sharding, dupe_active
+        )
         eval_step = make_eval_step(model_static, batch_sharding, dupe_active)
-        target_prob_step = make_target_prob_step(model_static, batch_sharding, dupe_active)
+        target_prob_step = make_target_prob_step(
+            model_static, batch_sharding, dupe_active
+        )
         timing_start_step = step + 4
         gc.collect()
 
     t0 = time.time()
     local_xs, local_ys, epoch = next_microbatches(train_loader, grad_accum_steps)
-    xs = make_global_array(local_xs, microbatch_sharding, (grad_accum_steps, global_batch_size, MAX_SEQ_LEN))
-    ys = make_global_array(local_ys, microbatch_sharding, (grad_accum_steps, global_batch_size, MAX_SEQ_LEN))
+    xs = make_global_array(
+        local_xs,
+        microbatch_sharding,
+        (grad_accum_steps, global_batch_size, MAX_SEQ_LEN),
+    )
+    ys = make_global_array(
+        local_ys,
+        microbatch_sharding,
+        (grad_accum_steps, global_batch_size, MAX_SEQ_LEN),
+    )
 
     lrm = get_lr_multiplier(step)
     if _swa_start_step >= 0 and step >= _swa_start_step:
         cycle_pos = (step - _swa_start_step) % steps_per_epoch
         swa_base = max(lrm, 0.05)
-        lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
+        lrm = (
+            0.05
+            + (swa_base - 0.05)
+            * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch))
+            / 2
+        )
     wdm = get_wd_multiplier(step)
     state, metrics = train_step(
         state,
@@ -1476,10 +1869,14 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     if step >= timing_start_step:
         total_training_time += dt
         timed_steps += 1
-    eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
+    eta_str = (
+        f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m"
+        if timed_steps > 0
+        else ""
+    )
     dupe_str = " [DUPE]" if dupe_active else ""
     print0(
-        f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | "
+        f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt * 1000:.2f}ms | "
         f"tok/sec: {tok_per_sec:,}{dupe_str}{eta_str}"
     )
     wandb_run.log(
@@ -1503,8 +1900,17 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             batch_sharding,
             global_batch_size,
         )
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+        print0(
+            f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}"
+        )
+        wandb_run.log(
+            {
+                "step": step,
+                "epoch": current_epoch,
+                "val/bpb": val_bpb,
+                "val/loss": val_loss,
+            }
+        )
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
             min_val_loss = val_loss
@@ -1516,14 +1922,18 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
                 break
 
         if logit_avg_count > 0:
-            ckpt_path = os.path.join(args.logit_avg_dir, f"epoch_{current_epoch:03d}.eqx")
+            ckpt_path = os.path.join(
+                args.logit_avg_dir, f"epoch_{current_epoch:03d}.eqx"
+            )
             save_params(ckpt_path, state.params)
             late_checkpoint_paths.append(ckpt_path)
             if len(late_checkpoint_paths) > logit_avg_count:
                 old = late_checkpoint_paths.pop(0)
                 if master_process and os.path.exists(old):
                     os.remove(old)
-            print0(f"  Saved checkpoint {ckpt_path} ({len(late_checkpoint_paths)}/{logit_avg_count})")
+            print0(
+                f"  Saved checkpoint {ckpt_path} ({len(late_checkpoint_paths)}/{logit_avg_count})"
+            )
 
         current_epoch = epoch
 
@@ -1544,7 +1954,9 @@ if logit_avg_count > 0:
 
     if len(ckpt_paths_for_logit) >= 2:
         n = len(ckpt_paths_for_logit)
-        print0(f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---")
+        print0(
+            f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---"
+        )
 
         def _run_mode(label: str, weights: list[float]) -> tuple[float, float]:
             print0(f"  [{label}] weights: {[f'{w:.3f}' for w in weights]}")
@@ -1561,7 +1973,9 @@ if logit_avg_count > 0:
                 global_batch_size,
             )
             print0(f"  [{label}] Val BPB: {bpb:.6f} | Val Loss: {loss:.6f}")
-            wandb_run.log({f"logit_avg_{label}/bpb": bpb, f"logit_avg_{label}/loss": loss})
+            wandb_run.log(
+                {f"logit_avg_{label}/bpb": bpb, f"logit_avg_{label}/loss": loss}
+            )
             return bpb, loss
 
         equal_w = [1.0 / n] * n
@@ -1581,7 +1995,7 @@ if logit_avg_count > 0:
                 print0("  ** New best! (logit avg recency weights)")
 
 
-print0(f"Total training time: {total_training_time/60:.2f}m")
+print0(f"Total training time: {total_training_time / 60:.2f}m")
 final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float("inf")
 print0(f"Final train loss: {final_train_loss:.6f}")
 print0(f"Min val BPB: {min_val_bpb:.6f}")
@@ -1606,7 +2020,7 @@ if master_process:
     print0(f"Result saved to {_result_out}")
 
 total_wall_time = time.time() - _script_start
-print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
+print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time / 60:.2f}m)")
 
 wandb_run.finish()
 if artifacts_log_f is not None:

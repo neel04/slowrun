@@ -8,6 +8,7 @@ dependencies = [
     "torch==2.10",
     "jax[cpu]",
     "equinox",
+    "jaxtyping",
     "optax",
     "orbax-checkpoint",
     "wandb",
@@ -25,3 +26,6 @@ tpu = [
 
 [tool.uv]
 package = false
+
+[tool.ruff.lint.per-file-ignores]
+"train.py" = ["F722"]

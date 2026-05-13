@@ -1,0 +1,7 @@
+{
+  "typeCheckingMode": "standard",
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": ["train.py", "prepare_data.py"],
+  "exclude": [".venv"]
+}
