@@ -40,7 +40,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
-import optax  # noqa: F401  # kept as an explicit dependency for the JAX training stack
 import tiktoken
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -1770,7 +1769,6 @@ train_step = make_train_step(
     model_static, opt_specs, grad_accum_steps, microbatch_sharding, dupe_active
 )
 eval_step = make_eval_step(model_static, batch_sharding, dupe_active)
-target_prob_step = make_target_prob_step(model_static, batch_sharding, dupe_active)
 
 step = 0
 current_epoch = train_loader.epoch
@@ -1785,6 +1783,11 @@ timing_start_step = 4
 
 late_checkpoint_paths: list[str] = []
 logit_avg_count = args.logit_avg
+target_prob_step = (
+    make_target_prob_step(model_static, batch_sharding, dupe_active)
+    if logit_avg_count > 0
+    else None
+)
 if logit_avg_count > 0 and master_process:
     os.makedirs(args.logit_avg_dir, exist_ok=True)
 if logit_avg_count > 0:
@@ -1817,9 +1820,10 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             model_static, opt_specs, grad_accum_steps, microbatch_sharding, dupe_active
         )
         eval_step = make_eval_step(model_static, batch_sharding, dupe_active)
-        target_prob_step = make_target_prob_step(
-            model_static, batch_sharding, dupe_active
-        )
+        if target_prob_step is not None:
+            target_prob_step = make_target_prob_step(
+                model_static, batch_sharding, dupe_active
+            )
         timing_start_step = step + 4
         gc.collect()
 
@@ -1953,6 +1957,7 @@ if logit_avg_count > 0:
         ckpt_paths_for_logit = late_checkpoint_paths
 
     if len(ckpt_paths_for_logit) >= 2:
+        assert target_prob_step is not None
         n = len(ckpt_paths_for_logit)
         print0(
             f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---"

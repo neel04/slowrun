@@ -2,6 +2,6 @@
   "typeCheckingMode": "standard",
   "venvPath": ".",
   "venv": ".venv",
-  "include": ["train.py", "prepare_data.py"],
+  "include": ["train.py", "tiny/train.py", "prepare_data.py"],
   "exclude": [".venv"]
 }

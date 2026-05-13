@@ -2,8 +2,6 @@ torch==2.10
 jax[cpu]
 equinox
 jaxtyping
-optax
-orbax-checkpoint
 wandb
 tiktoken
 numpy

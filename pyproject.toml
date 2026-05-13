@@ -9,8 +9,6 @@ dependencies = [
     "jax[cpu]",
     "equinox",
     "jaxtyping",
-    "optax",
-    "orbax-checkpoint",
     "wandb",
     "tiktoken",
     "numpy",
@@ -29,3 +27,4 @@ package = false
 
 [tool.ruff.lint.per-file-ignores]
 "train.py" = ["F722"]
+"tiny/train.py" = ["F722"]
