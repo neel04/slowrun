@@ -264,6 +264,11 @@ WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
 
+TPU_BF16_PEAK_FLOPS_PER_CHIP = {
+    "v4": 275e12,
+    "v6e": 918e12,
+}
+
 
 # =============================================================================
 # Utilities
@@ -332,6 +337,39 @@ def dtype_from_name(name: str):
     if name == "float32":
         return jnp.float32
     raise ValueError(f"unknown dtype {name}")
+
+
+def detect_peak_bf16_flops_per_chip() -> tuple[str, float | None]:
+    device_descs = sorted(
+        {
+            " ".join(
+                part
+                for part in (
+                    str(getattr(device, "platform", "")),
+                    str(getattr(device, "device_kind", "")),
+                )
+                if part
+            )
+            for device in jax.devices()
+        }
+    )
+    device_text = " ".join(device_descs).lower()
+    if "v6e" in device_text or "trillium" in device_text:
+        return "TPU v6e", TPU_BF16_PEAK_FLOPS_PER_CHIP["v6e"]
+    if "v4" in device_text:
+        return "TPU v4", TPU_BF16_PEAK_FLOPS_PER_CHIP["v4"]
+    return ", ".join(device_descs) or "unknown", None
+
+
+def compute_bf16_mfu_percent(
+    flops_per_token: float,
+    tokens_per_second: float,
+    peak_flops_per_chip: float | None,
+) -> float | None:
+    if peak_flops_per_chip is None:
+        return None
+    total_peak_flops = peak_flops_per_chip * jax.device_count()
+    return 100.0 * flops_per_token * tokens_per_second / total_peak_flops
 
 
 def rms_norm(
@@ -1743,8 +1781,17 @@ state = TrainState(params, opt_state, train_key, jnp.asarray(0, dtype=jnp.int32)
 
 param_counts = tree_sum(params)
 num_flops_per_token = model.estimate_flops(param_counts)
+accelerator_kind, peak_bf16_flops_per_chip = detect_peak_bf16_flops_per_chip()
 print0(f"Parameters: {param_counts:,}")
 print0(f"FLOPs per token: {num_flops_per_token:e}")
+if peak_bf16_flops_per_chip is not None:
+    total_peak_tflops = peak_bf16_flops_per_chip * jax.device_count() / 1e12
+    print0(
+        f"BF16 peak compute: {accelerator_kind}, {peak_bf16_flops_per_chip / 1e12:.0f} TFLOPs/chip, "
+        f"{total_peak_tflops:.0f} TFLOPs total"
+    )
+else:
+    print0(f"BF16 peak compute: unavailable for {accelerator_kind}; MFU will be n/a")
 
 mesh = Mesh(np.asarray(jax.devices()), ("data",))
 state_sharding = NamedSharding(mesh, P())
@@ -1939,7 +1986,12 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased = smooth_train_loss / (1 - ema_beta**step)
     pct = 100 * step / num_iterations
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+    tokens_per_second = TOTAL_BATCH_SIZE / dt
+    tok_per_sec = int(tokens_per_second)
+    bf16_mfu = compute_bf16_mfu_percent(
+        num_flops_per_token, tokens_per_second, peak_bf16_flops_per_chip
+    )
+    mfu_str = f" | bf16_mfu: {bf16_mfu:.2f}%" if bf16_mfu is not None else ""
     if step >= timing_start_step:
         total_training_time += dt
         timed_steps += 1
@@ -1951,18 +2003,20 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     dupe_str = " [DUPE]" if dupe_active else ""
     print0(
         f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt * 1000:.2f}ms | "
-        f"tok/sec: {tok_per_sec:,}{dupe_str}{eta_str}"
+        f"tok/sec: {tok_per_sec:,}{mfu_str}{dupe_str}{eta_str}"
     )
-    wandb_run.log(
-        {
-            "step": step,
-            "train/loss": debiased,
-            "train/lm_loss": float(metrics["lm_loss"]),
-            "train/mtp_loss": float(metrics["mtp_loss"]),
-            "train/lr_mult": lrm,
-            "train/wd_mult": wdm,
-        }
-    )
+    log_data = {
+        "step": step,
+        "train/loss": debiased,
+        "train/lm_loss": float(metrics["lm_loss"]),
+        "train/mtp_loss": float(metrics["mtp_loss"]),
+        "train/lr_mult": lrm,
+        "train/wd_mult": wdm,
+        "train/tok_per_sec": tokens_per_second,
+    }
+    if bf16_mfu is not None:
+        log_data["train/bf16_mfu"] = bf16_mfu
+    wandb_run.log(log_data)
 
     if epoch != current_epoch:
         val_bpb, val_loss = evaluate_bpb(
