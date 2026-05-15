@@ -47,6 +47,9 @@ from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
 
 import wandb
 
+JAX_DEFAULT_MATMUL_PRECISION = "float32"
+jax.config.update("jax_default_matmul_precision", JAX_DEFAULT_MATMUL_PRECISION)
+
 _script_start = time.time()
 
 
@@ -346,6 +349,8 @@ def dtype_from_name(name: str):
 
 def detect_peak_bf16_flops_per_chip() -> tuple[str, float | None]:
     device_kind = str(jax.devices()[0].device_kind)
+    if device_kind.lower() == "cpu":
+        return device_kind, None
     if device_kind not in PEAK_FLOPS_PER_CHIP:
         raise ValueError(
             f"Unknown device kind: {device_kind}. Available: "
@@ -366,7 +371,8 @@ def compute_bf16_mfu_percent(
 
 
 def rms_norm(
-    x: Float[Array, "... channels"], eps: float = 1e-6
+    x: Float[Array, "... channels"],
+    eps: float = float(np.finfo(np.float32).eps),
 ) -> Float[Array, "... channels"]:
     y = x.astype(jnp.float32)
     y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + eps)
@@ -443,6 +449,14 @@ def cross_entropy(
 def tree_sum(tree: Any) -> int:
     leaves = jtu.tree_leaves(tree)
     return int(sum(x.size for x in leaves if isinstance(x, jax.Array)))
+
+
+def seeded_randperm(size: int, seed: int) -> np.ndarray:
+    if torch is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return torch.randperm(size, generator=generator).numpy()
+    return np.random.RandomState(seed).permutation(size)
 
 
 def tree_zeros_like(tree: Any) -> Any:
@@ -523,10 +537,17 @@ class Linear(eqx.Module):
 class Embedding(eqx.Module):
     weight: Float[Array, "num_embeddings embedding_dim"]
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, key: PRNGKeyArray):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        key: PRNGKeyArray,
+        *,
+        param_dtype: Any = jnp.float32,
+    ):
         self.weight = jax.random.normal(
             key, (num_embeddings, embedding_dim), dtype=jnp.float32
-        )
+        ).astype(param_dtype)
 
     def __call__(
         self, idx: Int[Array, "..."], dtype: Any
@@ -604,9 +625,10 @@ class CausalSelfAttention(eqx.Module):
         weight: Float[Array, "heads_x_dim in_dim"],
         mix: Float[Array, "heads heads"],
         heads: int,
+        dtype: Any,
     ) -> Float[Array, "heads_x_dim in_dim"]:
-        w = weight.reshape(heads, self.head_dim, -1)
-        return jnp.einsum("hm,mdc->hdc", mix, w).reshape(weight.shape)
+        w = weight.astype(dtype).reshape(heads, self.head_dim, -1)
+        return jnp.einsum("hm,mdc->hdc", mix.astype(dtype), w).reshape(weight.shape)
 
     def __call__(
         self,
@@ -627,8 +649,8 @@ class CausalSelfAttention(eqx.Module):
             q_mix = self.q_mix
             k_mix = self.k_mix
             assert k_mix is not None
-            q_weight = self._fuse_mix(self.c_q.weight, q_mix, self.n_head)
-            k_weight = self._fuse_mix(self.c_k.weight, k_mix, self.n_kv_head)
+            q_weight = self._fuse_mix(self.c_q.weight, q_mix, self.n_head, dtype)
+            k_weight = self._fuse_mix(self.c_k.weight, k_mix, self.n_kv_head, dtype)
             q = jnp.matmul(x.astype(dtype), q_weight.astype(dtype).T).reshape(
                 B, T, self.n_head, self.head_dim
             )
@@ -637,7 +659,7 @@ class CausalSelfAttention(eqx.Module):
             )
             v_mix = self.v_mix
             if v_mix is not None:
-                v_weight = self._fuse_mix(self.c_v.weight, v_mix, self.n_kv_head)
+                v_weight = self._fuse_mix(self.c_v.weight, v_mix, self.n_kv_head, dtype)
                 v = jnp.matmul(x.astype(dtype), v_weight.astype(dtype).T).reshape(
                     B, T, self.n_kv_head, self.head_dim
                 )
@@ -764,7 +786,17 @@ class GPT(eqx.Module):
             4 + config.n_layer + config.n_layer + (2 if config.mtp_weight > 0 else 0)
         )
         keys = iter(jax.random.split(key, num_extra))
-        self.wte = Embedding(config.padded_vocab_size, config.n_embd, next(keys))
+        embed_param_dtype = (
+            dtype_from_name(config.compute_dtype)
+            if config.compute_dtype == "bfloat16"
+            else jnp.float32
+        )
+        self.wte = Embedding(
+            config.padded_vocab_size,
+            config.n_embd,
+            next(keys),
+            param_dtype=embed_param_dtype,
+        )
         self.blocks = tuple(Block(config, i, next(keys)) for i in range(config.n_layer))
         self.lm_head = Linear(
             config.n_embd,
@@ -821,18 +853,15 @@ class GPT(eqx.Module):
         deterministic: bool,
     ) -> tuple[Float[Array, "batch seq channels"], PRNGKeyArray]:
         dtype = dtype_from_name(self.config.compute_dtype)
+        # Torch autocast keeps these residual scalar ops in the widest input dtype.
         for i in range(start, end):
             j = self.config.n_layer - 1 - i
             if 0 <= j < self.encoder_layers:
                 x = (
                     x
-                    + self.skip_weights[i - self.encoder_layers].astype(dtype)
-                    * encoder_outputs[j]
+                    + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
                 )
-            x = (
-                self.resid_lambdas[i].astype(dtype) * x
-                + self.x0_lambdas[i].astype(dtype) * x0
-            )
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve_proj = self.ve_projs[i]
             ve = ve_proj(x0, dtype) if ve_proj is not None else None
             key, subkey = self._next_key(key)
@@ -861,11 +890,9 @@ class GPT(eqx.Module):
         x0 = x
 
         encoder_outputs: list[Float[Array, "batch seq channels"]] = []
+        # Torch autocast keeps these residual scalar ops in the widest input dtype.
         for i in range(self.encoder_layers):
-            x = (
-                self.resid_lambdas[i].astype(dtype) * x
-                + self.x0_lambdas[i].astype(dtype) * x0
-            )
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve_proj = self.ve_projs[i]
             ve = ve_proj(x0, dtype) if ve_proj is not None else None
             key, subkey = self._next_key(key)
@@ -965,7 +992,14 @@ class GPT(eqx.Module):
         max_keys = min(window + 1, seq_len)
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
-    def estimate_flops(self, nparams: int) -> float:
+    def estimate_flops(self) -> float:
+        nparams = tree_sum(self)
+        nparams_exclude = (
+            self.wte.weight.size
+            + self.resid_lambdas.size
+            + self.x0_lambdas.size
+            + self.skip_weights.size
+        )
         h, q, t = (
             self.config.n_head,
             self.config.n_embd // self.config.n_head,
@@ -974,7 +1008,7 @@ class GPT(eqx.Module):
         attn_flops = sum(
             12 * h * q * self._avg_causal_attended_keys(w, t) for w in self.window_sizes
         )
-        return 6 * nparams + attn_flops
+        return 6 * (nparams - nparams_exclude) + attn_flops
 
 
 # =============================================================================
@@ -1124,6 +1158,9 @@ def _adamw_update(
     lr_mult: Float[Array, ""],
     wd_mult: Float[Array, ""],
 ) -> tuple[Float[Array, "..."], Float[Array, "..."], Float[Array, "..."]]:
+    p_dtype = p.dtype
+    m_dtype = m.dtype
+    v_dtype = v.dtype
     lr = jnp.asarray(spec.lr, jnp.float32) * lr_mult
     wd = jnp.asarray(spec.weight_decay, jnp.float32) * wd_mult
     beta1 = jnp.asarray(spec.beta1, jnp.float32)
@@ -1135,7 +1172,7 @@ def _adamw_update(
     bias1 = 1.0 - beta1 ** step.astype(jnp.float32)
     bias2 = 1.0 - beta2 ** step.astype(jnp.float32)
     p32 = p32 - (lr / bias1) * m / (jnp.sqrt(v / bias2) + spec.eps)
-    return p32.astype(p.dtype), m, v
+    return p32.astype(p_dtype), m.astype(m_dtype), v.astype(v_dtype)
 
 
 def _muon_update(
@@ -1152,7 +1189,6 @@ def _muon_update(
     momentum = muon_momentum.astype(jnp.float32)
     momentum_buffer = momentum * momentum_buffer + (1.0 - momentum) * g
     g = (1.0 - momentum) * g + momentum * momentum_buffer
-    g = g / jnp.maximum(jnp.linalg.norm(g, axis=-1, keepdims=True), 1e-7)
     X = g.astype(jnp.bfloat16)
     X = X / (
         jnp.linalg.norm(X.astype(jnp.float32), axis=(-2, -1), keepdims=True).astype(
@@ -1170,23 +1206,23 @@ def _muon_update(
         for a, b, c in polar_express_coeffs[: spec.ns_steps]:
             A = X @ jnp.swapaxes(X, -1, -2)
             X = a * X + (b * A + c * (A @ A)) @ X
-    g = X.astype(jnp.float32)
+    g = X
 
     red_dim = -1 if g.shape[-2] >= g.shape[-1] else -2
     red_dim_size = g.shape[red_dim]
-    v_mean = jnp.mean(jnp.square(g), axis=red_dim, keepdims=True)
+    v_mean = jnp.mean(jnp.square(g.astype(jnp.float32)), axis=red_dim, keepdims=True)
     v_norm = jnp.sqrt(jnp.sum(v_mean, axis=(-2, -1), keepdims=True) * red_dim_size)
-    beta2 = jnp.asarray(spec.beta2, jnp.float32)
+    beta2 = jnp.asarray(spec.beta2, g.dtype)
     second_momentum_buffer = beta2 * second_momentum_buffer + (1.0 - beta2) * v_mean
     step_size = jax.lax.rsqrt(jnp.maximum(second_momentum_buffer, 1e-10))
     scaled_sq_sum = (v_mean * red_dim_size) * jnp.square(step_size)
     v_norm_new = jnp.sqrt(jnp.sum(scaled_sq_sum, axis=(-2, -1), keepdims=True))
     final_scale = step_size * (v_norm / jnp.maximum(v_norm_new, 1e-10))
-    g = g * final_scale
+    g = g * final_scale.astype(g.dtype)
 
-    lr = jnp.asarray(spec.lr, jnp.float32) * lr_mult
-    lr = lr * math.sqrt(max(1.0, p.shape[-2] / p.shape[-1]))
-    wd = jnp.asarray(spec.weight_decay, jnp.float32) * wd_mult
+    lr = (jnp.asarray(spec.lr, jnp.float32) * lr_mult).astype(g.dtype)
+    lr = lr * jnp.asarray(math.sqrt(max(1.0, p.shape[-2] / p.shape[-1])), g.dtype)
+    wd = (jnp.asarray(spec.weight_decay, jnp.float32) * wd_mult).astype(g.dtype)
     p32 = p.astype(jnp.float32)
     mask = (g * p32) >= 0
     p32 = p32 - (lr * g + lr * wd * p32 * mask)
@@ -1308,8 +1344,7 @@ class DataLoader:
         num_seqs = len(tokens) // self.seq_size
         all_seqs = tokens[: num_seqs * self.seq_size].reshape(num_seqs, self.seq_size)
         if self.doc_shuffle:
-            rng = np.random.RandomState(self.epoch + 1000)
-            all_seqs = all_seqs[rng.permutation(num_seqs)]
+            all_seqs = all_seqs[seeded_randperm(num_seqs, self.epoch + 1000)]
         else:
             perm = np.random.RandomState(self.default_shuffle_seed).permutation(
                 num_seqs
@@ -1337,8 +1372,7 @@ class DataLoader:
         self.epoch += 1
         print0(f"Starting epoch {self.epoch}")
         if self.doc_shuffle:
-            rng = np.random.RandomState(self.epoch)
-            perm = rng.permutation(len(self.doc_tokens))
+            perm = seeded_randperm(len(self.doc_tokens), self.epoch)
             self.doc_tokens = [self.doc_tokens[i] for i in perm.tolist()]
             self._build_batches()
         else:
@@ -1634,7 +1668,9 @@ def update_ema_params(
     beta: Float[Array, ""],
 ) -> PyTree[Float[Array, "..."] | None]:
     return jtu.tree_map(
-        lambda ema, p: None if p is None else ema + (p - ema) * (1.0 - beta),
+        lambda ema, p: None
+        if p is None
+        else (ema + (p - ema) * (1.0 - beta)).astype(ema.dtype),
         ema_params,
         params,
         is_leaf=lambda x: x is None,
@@ -1646,16 +1682,25 @@ def weighted_average_params(
     ckpt_paths: list[str],
     weights: list[float],
 ) -> PyTree[Float[Array, "..."] | None]:
-    avg_params = tree_zeros_like(params_skeleton)
+    avg_params = jtu.tree_map(
+        lambda p: None if p is None else jnp.zeros(p.shape, dtype=jnp.float32),
+        params_skeleton,
+        is_leaf=lambda x: x is None,
+    )
     for path, weight in zip(ckpt_paths, weights):
         params = eqx.tree_deserialise_leaves(path, params_skeleton)
         avg_params = jtu.tree_map(
-            lambda avg, p: None if p is None else avg + p * weight,
+            lambda avg, p: None if p is None else avg + p.astype(jnp.float32) * weight,
             avg_params,
             params,
             is_leaf=lambda x: x is None,
         )
-    return avg_params
+    return jtu.tree_map(
+        lambda avg, ref: None if ref is None else avg.astype(ref.dtype),
+        avg_params,
+        params_skeleton,
+        is_leaf=lambda x: x is None,
+    )
 
 
 # =============================================================================
@@ -1718,6 +1763,7 @@ print0(
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
 print0(f"  iha={args.iha}, iha_lr={args.iha_lr}")
+print0(f"  jax_default_matmul_precision={JAX_DEFAULT_MATMUL_PRECISION}")
 print0(
     f"  jax_processes={jax.process_count()}, local_devices={jax.local_device_count()}, devices={jax.device_count()}"
 )
@@ -1773,7 +1819,7 @@ opt_state = init_optimizer_state(params, opt_specs)
 state = TrainState(params, opt_state, train_key, jnp.asarray(0, dtype=jnp.int32))
 
 param_counts = tree_sum(params)
-num_flops_per_token = model.estimate_flops(param_counts)
+num_flops_per_token = model.estimate_flops()
 accelerator_kind, peak_bf16_flops_per_chip = detect_peak_bf16_flops_per_chip()
 print0(f"Parameters: {param_counts:,}")
 print0(f"FLOPs per token: {num_flops_per_token:e}")
@@ -2082,8 +2128,9 @@ if ema_params is not None:
     if ema_updates > 0:
         correction = 1.0 / (1.0 - param_ema_beta**ema_updates)
         ema_eval_params = jtu.tree_map(
-            lambda p: None if p is None else p * correction,
+            lambda ema, p: None if p is None else (ema * correction).astype(p.dtype),
             ema_params,
+            state.params,
             is_leaf=lambda x: x is None,
         )
         ema_bpb, ema_loss = evaluate_bpb(
