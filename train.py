@@ -433,6 +433,14 @@ def tree_sum(tree: Any) -> int:
     return int(sum(x.size for x in leaves if isinstance(x, jax.Array)))
 
 
+def seeded_randperm(size: int, seed: int) -> np.ndarray:
+    if torch is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return torch.randperm(size, generator=generator).numpy()
+    return np.random.RandomState(seed).permutation(size)
+
+
 def tree_zeros_like(tree: Any) -> Any:
     return jtu.tree_map(
         lambda x: jnp.zeros_like(x) if isinstance(x, jax.Array) else None, tree
@@ -948,7 +956,14 @@ class GPT(eqx.Module):
         max_keys = min(window + 1, seq_len)
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
-    def estimate_flops(self, nparams: int) -> float:
+    def estimate_flops(self) -> float:
+        nparams = tree_sum(self)
+        nparams_exclude = (
+            self.wte.weight.size
+            + self.resid_lambdas.size
+            + self.x0_lambdas.size
+            + self.skip_weights.size
+        )
         h, q, t = (
             self.config.n_head,
             self.config.n_embd // self.config.n_head,
@@ -957,7 +972,7 @@ class GPT(eqx.Module):
         attn_flops = sum(
             12 * h * q * self._avg_causal_attended_keys(w, t) for w in self.window_sizes
         )
-        return 6 * nparams + attn_flops
+        return 6 * (nparams - nparams_exclude) + attn_flops
 
 
 # =============================================================================
@@ -1289,8 +1304,7 @@ class DataLoader:
         num_seqs = len(tokens) // self.seq_size
         all_seqs = tokens[: num_seqs * self.seq_size].reshape(num_seqs, self.seq_size)
         if self.doc_shuffle:
-            rng = np.random.RandomState(self.epoch + 1000)
-            all_seqs = all_seqs[rng.permutation(num_seqs)]
+            all_seqs = all_seqs[seeded_randperm(num_seqs, self.epoch + 1000)]
         else:
             perm = np.random.RandomState(self.default_shuffle_seed).permutation(
                 num_seqs
@@ -1318,8 +1332,7 @@ class DataLoader:
         self.epoch += 1
         print0(f"Starting epoch {self.epoch}")
         if self.doc_shuffle:
-            rng = np.random.RandomState(self.epoch)
-            perm = rng.permutation(len(self.doc_tokens))
+            perm = seeded_randperm(len(self.doc_tokens), self.epoch)
             self.doc_tokens = [self.doc_tokens[i] for i in perm.tolist()]
             self._build_batches()
         else:
@@ -1719,7 +1732,7 @@ opt_state = init_optimizer_state(params, opt_specs)
 state = TrainState(params, opt_state, train_key, jnp.asarray(0, dtype=jnp.int32))
 
 param_counts = tree_sum(params)
-num_flops_per_token = model.estimate_flops(param_counts)
+num_flops_per_token = model.estimate_flops()
 accelerator_kind, peak_bf16_flops_per_chip = detect_peak_bf16_flops_per_chip()
 print0(f"Parameters: {param_counts:,}")
 print0(f"FLOPs per token: {num_flops_per_token:e}")
