@@ -73,6 +73,47 @@ parser.add_argument("--weight-decay", type=float, default=1.3)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=30)
+parser.add_argument(
+    "--num-iterations",
+    type=int,
+    default=3,
+    help="Maximum recurrent iterations through the network",
+)
+parser.add_argument(
+    "--iteration-schedule",
+    type=str,
+    default="constant",
+    choices=["constant", "compute-matched"],
+    help=(
+        "Schedule recurrent iterations over training. "
+        "'compute-matched' ramps from --min-iterations through each integer stage "
+        "to --num-iterations so average layer-passes match --compute-equivalent-layers."
+    ),
+)
+parser.add_argument(
+    "--min-iterations",
+    type=int,
+    default=1,
+    help="Initial recurrent iterations for --iteration-schedule compute-matched",
+)
+parser.add_argument(
+    "--compute-equivalent-layers",
+    type=float,
+    default=30.0,
+    help="Target average baseline-width-equivalent layer-passes per token",
+)
+parser.add_argument(
+    "--compute-reference-n-embd",
+    type=float,
+    default=1792.0,
+    help="Reference model width used by --compute-equivalent-layers",
+)
+parser.add_argument(
+    "--compute-width-power",
+    type=float,
+    default=2.0,
+    help="Width scaling exponent for compute matching; dense matmuls are ~2.0",
+)
 parser.add_argument("--n_head", type=int, default=14)
 parser.add_argument("--n_embd", type=int, default=1792)
 parser.add_argument("--lr_multiplier", type=float, default=0.25)
@@ -82,7 +123,10 @@ parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default="main")
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument(
-    "--dupe-start-epoch", type=int, default=7, help="Epoch to enable layer duplication"
+    "--dupe-start-epoch",
+    type=int,
+    default=None,
+    help="Epoch to enable layer duplication (default: disabled)",
 )
 parser.add_argument(
     "--dupe-layers-start",
@@ -149,6 +193,14 @@ parser.add_argument(
     type=float,
     default=0.05,
     help="Stochastic depth max drop rate (linear schedule, 0=off)",
+)
+parser.add_argument(
+    "--hira-rank",
+    "--param-relax-rank",
+    dest="hira_rank",
+    type=int,
+    default=64,
+    help="Rank for per-iteration ABBA parameter relaxation adapters (0=disabled)",
 )
 parser.add_argument(
     "--mtp-weight",
@@ -224,12 +276,18 @@ if args.jax_distributed:
 # Hyperparameters
 # =============================================================================
 
+NUM_ITERATIONS = args.num_iterations
 DEPTH = args.n_layer
 N_EMBD = args.n_embd
 N_HEAD = args.n_head
 assert N_EMBD % N_HEAD == 0, "n_embd must be divisible by n_head"
 HEAD_DIM = N_EMBD // N_HEAD
 assert HEAD_DIM % 2 == 0, "RoPE requires an even head_dim"
+if args.compute_reference_n_embd <= 0:
+    raise ValueError("--compute-reference-n-embd must be > 0")
+COMPUTE_WIDTH_SCALE = (
+    N_EMBD / args.compute_reference_n_embd
+) ** args.compute_width_power
 MAX_SEQ_LEN = args.sequence_length
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -258,6 +316,10 @@ WARMDOWN_POWER = 0.5
 WD_PRE_HOLD_FRAC = 0.40
 WD_SWA_LOW_FACTOR = 0.65
 WD_SWA_HIGH_FACTOR = 1.50
+FINAL_EXTRA_EVAL_ITERATIONS = 2
+TRAIN_BACKPROP_ITERATIONS = 1
+if TRAIN_BACKPROP_ITERATIONS < 1:
+    raise ValueError("TRAIN_BACKPROP_ITERATIONS must be >= 1")
 
 PEAK_FLOPS_PER_CHIP = {
     "TPU v4": 275e12,
@@ -322,6 +384,168 @@ class TeeStream:
 
     def fileno(self):
         return self.streams[0].fileno()
+
+
+@dataclass(frozen=True)
+class IterationScheduleStage:
+    start_frac: float
+    end_frac: float
+    iterations: int
+
+
+@dataclass(frozen=True)
+class IterationSchedule:
+    stages: tuple[IterationScheduleStage, ...]
+    avg_iterations: float
+    target_effective_layers: float
+    width_compute_scale: float
+
+
+def build_iteration_schedule(
+    schedule_name: str,
+    min_iterations: int,
+    max_iterations: int,
+    n_layer: int,
+    target_effective_layers: float,
+    width_compute_scale: float,
+    warmdown_ratio: float,
+) -> IterationSchedule:
+    if max_iterations < 1:
+        raise ValueError("--num-iterations must be >= 1")
+    if min_iterations < 1:
+        raise ValueError("--min-iterations must be >= 1")
+    if min_iterations > max_iterations:
+        raise ValueError("--min-iterations must be <= --num-iterations")
+    if n_layer <= 0:
+        raise ValueError("--n_layer must be > 0")
+    if width_compute_scale <= 0:
+        raise ValueError("width_compute_scale must be > 0")
+
+    if schedule_name == "constant":
+        avg_iterations = float(max_iterations)
+        return IterationSchedule(
+            stages=(IterationScheduleStage(0.0, 1.0, max_iterations),),
+            avg_iterations=avg_iterations,
+            target_effective_layers=n_layer * avg_iterations * width_compute_scale,
+            width_compute_scale=width_compute_scale,
+        )
+
+    target_iterations = target_effective_layers / (n_layer * width_compute_scale)
+    if target_iterations < min_iterations or target_iterations > max_iterations:
+        raise ValueError(
+            "--compute-equivalent-layers requires an average of "
+            f"{target_iterations:.3f} iterations for n_layer={n_layer} "
+            f"and width_compute_scale={width_compute_scale:.3f}, outside "
+            f"[--min-iterations={min_iterations}, --num-iterations={max_iterations}]"
+        )
+
+    if min_iterations == max_iterations:
+        if abs(target_iterations - max_iterations) > 1e-9:
+            raise ValueError(
+                "Cannot compute-match with equal min/max iterations unless the "
+                "target equals that iteration count"
+            )
+        return IterationSchedule(
+            stages=(IterationScheduleStage(0.0, 1.0, max_iterations),),
+            avg_iterations=float(max_iterations),
+            target_effective_layers=target_effective_layers,
+            width_compute_scale=width_compute_scale,
+        )
+
+    warmdown_duration = min(max(warmdown_ratio, 0.0), 1.0)
+    extra_iterations = target_iterations - min_iterations
+    threshold_count = max_iterations - min_iterations
+    min_extra_with_max_before_warmdown = threshold_count * warmdown_duration
+    if extra_iterations < min_extra_with_max_before_warmdown - 1e-9:
+        warmdown_start_frac = 1.0 - warmdown_duration
+        raise ValueError(
+            "Compute-matched schedule cannot reach --num-iterations by warmdown "
+            f"start ({warmdown_start_frac:.3f}) without exceeding the compute "
+            f"target. Minimum average iterations would be "
+            f"{min_iterations + min_extra_with_max_before_warmdown:.3f}, "
+            f"but target is {target_iterations:.3f}."
+        )
+
+    suffix_durations = [warmdown_duration] * threshold_count
+    remaining_extra = extra_iterations - min_extra_with_max_before_warmdown
+    for i in range(threshold_count):
+        capacity = 1.0 - suffix_durations[i]
+        add = min(remaining_extra, capacity)
+        suffix_durations[i] += add
+        remaining_extra -= add
+        if remaining_extra <= 1e-9:
+            break
+    if remaining_extra > 1e-9:
+        raise ValueError(
+            "Could not build compute-matched iteration schedule; target average "
+            f"iterations {target_iterations:.3f} is too high"
+        )
+
+    durations = [1.0 - suffix_durations[0]]
+    for i in range(1, threshold_count):
+        durations.append(suffix_durations[i - 1] - suffix_durations[i])
+    durations.append(suffix_durations[-1])
+
+    stages: list[IterationScheduleStage] = []
+    start_frac = 0.0
+    for offset, duration in enumerate(durations):
+        if duration <= 1e-9:
+            continue
+        end_frac = min(1.0, start_frac + duration)
+        stages.append(
+            IterationScheduleStage(start_frac, end_frac, min_iterations + offset)
+        )
+        start_frac = end_frac
+    if stages:
+        stages[-1] = IterationScheduleStage(
+            stages[-1].start_frac, 1.0, stages[-1].iterations
+        )
+    else:
+        stages = [IterationScheduleStage(0.0, 1.0, max_iterations)]
+
+    avg_iterations = sum(
+        (stage.end_frac - stage.start_frac) * stage.iterations for stage in stages
+    )
+    return IterationSchedule(
+        stages=tuple(stages),
+        avg_iterations=avg_iterations,
+        target_effective_layers=target_effective_layers,
+        width_compute_scale=width_compute_scale,
+    )
+
+
+def get_scheduled_iterations(
+    schedule: IterationSchedule, step: int, total_steps: int
+) -> int:
+    if total_steps <= 0:
+        return schedule.stages[-1].iterations
+    frac = min(max(step / total_steps, 0.0), 1.0)
+    for stage in schedule.stages:
+        if frac < stage.end_frac or stage is schedule.stages[-1]:
+            return stage.iterations
+    return schedule.stages[-1].iterations
+
+
+def format_iteration_schedule(schedule: IterationSchedule) -> str:
+    return ", ".join(
+        f"{stage.start_frac:.3f}-{stage.end_frac:.3f}: {stage.iterations}x"
+        for stage in schedule.stages
+    )
+
+
+def iteration_schedule_counts(schedule: IterationSchedule) -> tuple[int, ...]:
+    return tuple(dict.fromkeys(stage.iterations for stage in schedule.stages))
+
+
+ITERATION_SCHEDULE = build_iteration_schedule(
+    args.iteration_schedule,
+    args.min_iterations,
+    NUM_ITERATIONS,
+    DEPTH,
+    args.compute_equivalent_layers,
+    COMPUTE_WIDTH_SCALE,
+    WARMDOWN_RATIO,
+)
 
 
 def resolve_run_dir(run_name: str | None) -> tuple[str, str]:
@@ -478,6 +702,8 @@ class GPTConfig:
     window_pattern: str
     dropout: float
     stoch_depth: float
+    num_iterations: int
+    hira_rank: int
     use_iha: bool
     iha_mix_v: bool
     mtp_weight: float
@@ -513,6 +739,84 @@ class Linear(eqx.Module):
         self, x: Float[Array, "... in_features"], dtype: Any
     ) -> Float[Array, "... out_features"]:
         return jnp.matmul(x.astype(dtype), self.weight.astype(dtype).T)
+
+
+def megatron_uniform(
+    key: PRNGKeyArray, shape: tuple[int, int]
+) -> Float[Array, "dim0 dim1"]:
+    fan_in, fan_out = shape
+    std = math.sqrt(0.33 / fan_in)
+    lim = fan_out**-0.5
+    return (
+        jax.random.uniform(key, shape, minval=-lim, maxval=lim, dtype=jnp.float32) * std
+    )
+
+
+def new_gelu(x: Float[Array, "..."]) -> Float[Array, "..."]:
+    c = math.sqrt(2.0 / math.pi)
+    return 0.5 * x * (1.0 + jnp.tanh(c * (x + 0.044715 * jnp.power(x, 3.0))))
+
+
+class ABBA(eqx.Module):
+    B_1: Float[Array, "in_dim rank"]
+    A_1: Float[Array, "rank out_dim"]
+    B_2: Float[Array, "in_dim rank"]
+    A_2: Float[Array, "rank out_dim"]
+    in_dim: int = eqx.field(static=True)
+    out_dim: int = eqx.field(static=True)
+    rank: int = eqx.field(static=True)
+    scale: float = eqx.field(static=True)
+    use_dense_weight: bool = eqx.field(static=True)
+
+    def __init__(self, in_dim: int, out_dim: int, rank: int, key: PRNGKeyArray):
+        k1, k2, _k3, k4 = jax.random.split(key, 4)
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.rank = rank
+        self.scale = 1.0 / rank
+        self.use_dense_weight = rank * rank * (in_dim + out_dim) >= in_dim * out_dim
+        self.B_1 = megatron_uniform(k1, (in_dim, rank))
+        self.A_1 = megatron_uniform(k2, (rank, out_dim))
+        self.B_2 = jnp.zeros((in_dim, rank), dtype=jnp.float32)
+        self.A_2 = megatron_uniform(k4, (rank, out_dim))
+
+    def _forward_rank_squared(
+        self, x: Float[Array, "... in_dim"], dtype: Any
+    ) -> Float[Array, "... out_dim"]:
+        a_kr = (
+            (
+                jnp.swapaxes(self.A_1, -1, -2)[..., None]
+                * jnp.swapaxes(self.A_2, -1, -2)[..., None, :]
+            )
+            .reshape(self.out_dim, self.rank * self.rank)
+            .T.astype(dtype)
+        )
+        b_kr = (
+            (self.B_1[..., None] * self.B_2[:, None, :])
+            .reshape(self.in_dim, self.rank * self.rank)
+            .astype(dtype)
+        )
+        return jnp.matmul(jnp.matmul(x.astype(dtype), b_kr), a_kr)
+
+    def _forward_dense_weight(
+        self, x: Float[Array, "... in_dim"], dtype: Any
+    ) -> Float[Array, "... out_dim"]:
+        weight = (self.B_1 @ self.A_1) * (self.B_2 @ self.A_2)
+        return jnp.matmul(x.astype(dtype), weight.astype(dtype))
+
+    def __call__(
+        self, x: Float[Array, "... in_dim"], dtype: Any
+    ) -> Float[Array, "... out_dim"]:
+        if self.use_dense_weight:
+            out = self._forward_dense_weight(x, dtype)
+        else:
+            out = self._forward_rank_squared(x, dtype)
+        return (self.scale * out).astype(x.dtype)
+
+    def compute_matmul_params(self) -> int:
+        if self.use_dense_weight:
+            return self.in_dim * self.out_dim
+        return self.rank * self.rank * (self.in_dim + self.out_dim)
 
 
 class Embedding(eqx.Module):
@@ -707,12 +1011,35 @@ class MLP(eqx.Module):
 class Block(eqx.Module):
     attn: CausalSelfAttention
     mlp: MLP
+    attn_relax: tuple[ABBA, ...] | None
+    mlp_relax: tuple[ABBA, ...] | None
     drop_prob: float = eqx.field(static=True)
 
-    def __init__(self, config: GPTConfig, layer_idx: int, key: PRNGKeyArray):
-        k1, k2 = jax.random.split(key, 2)
+    def __init__(
+        self,
+        config: GPTConfig,
+        layer_idx: int,
+        key: PRNGKeyArray,
+        *,
+        enable_relax: bool = True,
+    ):
+        keys = iter(jax.random.split(key, 2 + 2 * config.num_iterations))
+        k1 = next(keys)
+        k2 = next(keys)
         self.attn = CausalSelfAttention(config, layer_idx, k1)
         self.mlp = MLP(config, k2)
+        if enable_relax and config.hira_rank > 0:
+            self.attn_relax = tuple(
+                ABBA(config.n_embd, config.n_embd, config.hira_rank, next(keys))
+                for _ in range(config.num_iterations)
+            )
+            self.mlp_relax = tuple(
+                ABBA(config.n_embd, config.n_embd, config.hira_rank, next(keys))
+                for _ in range(config.num_iterations)
+            )
+        else:
+            self.attn_relax = None
+            self.mlp_relax = None
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
     def __call__(
@@ -727,13 +1054,25 @@ class Block(eqx.Module):
         key: PRNGKeyArray,
         deterministic: bool,
         config: GPTConfig,
+        iteration_idx: int | None,
     ) -> Float[Array, "batch seq channels"]:
+        dtype = dtype_from_name(config.compute_dtype)
         k_attn, k_mlp, k_depth = jax.random.split(key, 3)
         x_in = x
-        x = x + self.attn(
-            rms_norm(x), ve, cos_sin, window_size, k_attn, deterministic, config
+        x_norm = rms_norm(x)
+        attn_out = self.attn(
+            x_norm, ve, cos_sin, window_size, k_attn, deterministic, config
         )
-        x = x + self.mlp(rms_norm(x), k_mlp, deterministic, config)
+        if self.attn_relax is not None and iteration_idx is not None:
+            relax_idx = min(iteration_idx, len(self.attn_relax) - 1)
+            attn_out = attn_out + new_gelu(self.attn_relax[relax_idx](x_norm, dtype))
+        x = x + attn_out
+        x_norm = rms_norm(x)
+        mlp_out = self.mlp(x_norm, k_mlp, deterministic, config)
+        if self.mlp_relax is not None and iteration_idx is not None:
+            relax_idx = min(iteration_idx, len(self.mlp_relax) - 1)
+            mlp_out = mlp_out + new_gelu(self.mlp_relax[relax_idx](x_norm, dtype))
+        x = x + mlp_out
         if not deterministic and self.drop_prob > 0:
             keep = (jax.random.uniform(k_depth, ()) >= self.drop_prob).astype(x.dtype)
             x = x_in + keep * (x - x_in)
@@ -797,7 +1136,9 @@ class GPT(eqx.Module):
             self.mtp_proj = Linear(
                 2 * config.n_embd, config.n_embd, next(keys), init="uniform", scale=s
             )
-            self.mtp_block = Block(config, config.n_layer, next(keys))
+            self.mtp_block = Block(
+                config, config.n_layer, next(keys), enable_relax=False
+            )
         else:
             self.mtp_proj = None
             self.mtp_block = None
@@ -827,22 +1168,112 @@ class GPT(eqx.Module):
         end: int,
         key: PRNGKeyArray,
         deterministic: bool,
+        iteration_idx: int,
     ) -> tuple[Float[Array, "batch seq channels"], PRNGKeyArray]:
         dtype = dtype_from_name(self.config.compute_dtype)
         # Torch autocast keeps these residual scalar ops in the widest input dtype.
         for i in range(start, end):
             j = self.config.n_layer - 1 - i
             if 0 <= j < self.encoder_layers:
-                x = (
-                    x
-                    + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
-                )
+                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve_proj = self.ve_projs[i]
             ve = ve_proj(x0, dtype) if ve_proj is not None else None
             key, subkey = self._next_key(key)
             x = self.blocks[i](
-                x, ve, cos_sin, self.window_sizes[i], subkey, deterministic, self.config
+                x,
+                ve,
+                cos_sin,
+                self.window_sizes[i],
+                subkey,
+                deterministic,
+                self.config,
+                iteration_idx,
+            )
+        return x, key
+
+    def _run_network_once(
+        self,
+        x: Float[Array, "batch seq channels"],
+        cos_sin: tuple[
+            Float[Array, "1 seq 1 half_head_dim"],
+            Float[Array, "1 seq 1 half_head_dim"],
+        ],
+        key: PRNGKeyArray,
+        deterministic: bool,
+        dupe_enabled: bool,
+        dupe_start: int,
+        dupe_end: int,
+        dupe_loops: int,
+        iteration_idx: int,
+    ) -> tuple[Float[Array, "batch seq channels"], PRNGKeyArray]:
+        dtype = dtype_from_name(self.config.compute_dtype)
+        x0 = x
+        encoder_outputs: list[Float[Array, "batch seq channels"]] = []
+        # Torch autocast keeps these residual scalar ops in the widest input dtype.
+        for i in range(self.encoder_layers):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve_proj = self.ve_projs[i]
+            ve = ve_proj(x0, dtype) if ve_proj is not None else None
+            key, subkey = self._next_key(key)
+            x = self.blocks[i](
+                x,
+                ve,
+                cos_sin,
+                self.window_sizes[i],
+                subkey,
+                deterministic,
+                self.config,
+                iteration_idx,
+            )
+            encoder_outputs.append(x)
+
+        if not dupe_enabled:
+            x, key = self._run_decoder_layers(
+                x,
+                x0,
+                encoder_outputs,
+                cos_sin,
+                self.encoder_layers,
+                self.config.n_layer,
+                key,
+                deterministic,
+                iteration_idx,
+            )
+        else:
+            x, key = self._run_decoder_layers(
+                x,
+                x0,
+                encoder_outputs,
+                cos_sin,
+                self.encoder_layers,
+                dupe_end,
+                key,
+                deterministic,
+                iteration_idx,
+            )
+            for _ in range(dupe_loops):
+                x, key = self._run_decoder_layers(
+                    x,
+                    x0,
+                    encoder_outputs,
+                    cos_sin,
+                    dupe_start,
+                    dupe_end,
+                    key,
+                    deterministic,
+                    iteration_idx,
+                )
+            x, key = self._run_decoder_layers(
+                x,
+                x0,
+                encoder_outputs,
+                cos_sin,
+                dupe_end,
+                self.config.n_layer,
+                key,
+                deterministic,
+                iteration_idx,
             )
         return x, key
 
@@ -858,70 +1289,45 @@ class GPT(eqx.Module):
         dupe_start: int,
         dupe_end: int,
         dupe_loops: int,
+        num_iterations: int | None = None,
+        allow_extra_iterations: bool = False,
     ) -> Any:
         dtype = dtype_from_name(self.config.compute_dtype)
         _, T = idx.shape
+        active_num_iterations = (
+            self.config.num_iterations if num_iterations is None else num_iterations
+        )
+        max_num_iterations = self.config.num_iterations
+        if allow_extra_iterations and deterministic:
+            max_num_iterations += FINAL_EXTRA_EVAL_ITERATIONS
+        if not 1 <= active_num_iterations <= max_num_iterations:
+            raise ValueError(
+                f"num_iterations must be in [1, {max_num_iterations}], "
+                f"got {active_num_iterations}"
+            )
         cos_sin = precompute_rotary(T, self.config.n_embd // self.config.n_head, dtype)
         x = rms_norm(self.wte(idx, dtype))
-        x0 = x
 
-        encoder_outputs: list[Float[Array, "batch seq channels"]] = []
-        # Torch autocast keeps these residual scalar ops in the widest input dtype.
-        for i in range(self.encoder_layers):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve_proj = self.ve_projs[i]
-            ve = ve_proj(x0, dtype) if ve_proj is not None else None
-            key, subkey = self._next_key(key)
-            x = self.blocks[i](
-                x, ve, cos_sin, self.window_sizes[i], subkey, deterministic, self.config
-            )
-            encoder_outputs.append(x)
+        grad_start_iteration = 0
+        if not deterministic:
+            backprop_iterations = min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations)
+            grad_start_iteration = active_num_iterations - backprop_iterations
 
-        if not dupe_enabled:
-            x, key = self._run_decoder_layers(
+        for iteration in range(active_num_iterations):
+            x, key = self._run_network_once(
                 x,
-                x0,
-                encoder_outputs,
                 cos_sin,
-                self.encoder_layers,
-                self.config.n_layer,
                 key,
                 deterministic,
-            )
-        else:
-            x, key = self._run_decoder_layers(
-                x,
-                x0,
-                encoder_outputs,
-                cos_sin,
-                self.encoder_layers,
+                dupe_enabled,
+                dupe_start,
                 dupe_end,
-                key,
-                deterministic,
+                dupe_loops,
+                iteration,
             )
-            for _ in range(dupe_loops):
-                x, key = self._run_decoder_layers(
-                    x,
-                    x0,
-                    encoder_outputs,
-                    cos_sin,
-                    dupe_start,
-                    dupe_end,
-                    key,
-                    deterministic,
-                )
-            x, key = self._run_decoder_layers(
-                x,
-                x0,
-                encoder_outputs,
-                cos_sin,
-                dupe_end,
-                self.config.n_layer,
-                key,
-                deterministic,
-            )
-
-        x = rms_norm(x)
+            x = rms_norm(x)
+            if not deterministic and iteration < grad_start_iteration:
+                x = jax.lax.stop_gradient(x)
         logits = self.lm_head(x, dtype)[..., : self.config.vocab_size].astype(
             jnp.float32
         )
@@ -949,7 +1355,16 @@ class GPT(eqx.Module):
         )
         key, subkey = self._next_key(key)
         mtp_out = rms_norm(
-            mtp_block(combined, None, mtp_cos_sin, -1, subkey, deterministic, self.config)
+            mtp_block(
+                combined,
+                None,
+                mtp_cos_sin,
+                -1,
+                subkey,
+                deterministic,
+                self.config,
+                None,
+            )
         )
         mtp_logits = self.lm_head(mtp_out, dtype)[..., : self.config.vocab_size].astype(
             jnp.float32
@@ -968,8 +1383,39 @@ class GPT(eqx.Module):
         max_keys = min(window + 1, seq_len)
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
-    def estimate_flops(self) -> float:
+    def estimate_flops(self, num_iterations: int | None = None) -> float:
+        active_num_iterations = (
+            self.config.num_iterations if num_iterations is None else num_iterations
+        )
+        if not 1 <= active_num_iterations <= self.config.num_iterations:
+            raise ValueError(
+                f"num_iterations must be in [1, {self.config.num_iterations}], "
+                f"got {active_num_iterations}"
+            )
         nparams = tree_sum(self)
+        relax_modules = [
+            adapter
+            for block in self.blocks
+            for relax in (block.attn_relax, block.mlp_relax)
+            if relax is not None
+            for adapter in relax
+        ]
+        active_relax_modules = [
+            adapter
+            for block in self.blocks
+            for relax in (block.attn_relax, block.mlp_relax)
+            if relax is not None
+            for adapter in relax[:active_num_iterations]
+        ]
+        relax_params = sum(tree_sum(adapter) for adapter in relax_modules)
+        relax_compute_params = sum(
+            adapter.compute_matmul_params() for adapter in active_relax_modules
+        )
+        shared_recurrent_params = (
+            sum(tree_sum(block) for block in self.blocks)
+            - relax_params
+            + sum(tree_sum(proj) for proj in self.ve_projs if proj is not None)
+        )
         nparams_exclude = (
             self.wte.weight.size
             + self.resid_lambdas.size
@@ -981,10 +1427,18 @@ class GPT(eqx.Module):
             self.config.n_embd // self.config.n_head,
             self.config.sequence_len,
         )
-        attn_flops = sum(
+        attn_flops = active_num_iterations * sum(
             12 * h * q * self._avg_causal_attended_keys(w, t) for w in self.window_sizes
         )
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        extra_nonshared_params = (
+            nparams - nparams_exclude - shared_recurrent_params - relax_params
+        )
+        effective_params = (
+            extra_nonshared_params
+            + active_num_iterations * shared_recurrent_params
+            + relax_compute_params
+        )
+        return 6 * effective_params + attn_flops
 
 
 # =============================================================================
@@ -1391,6 +1845,7 @@ def make_train_step(
     grad_accum_steps: int,
     microbatch_sharding: NamedSharding,
     dupe_enabled: bool,
+    num_iterations: int,
 ):
     @eqx.filter_value_and_grad(has_aux=True)
     def loss_fn(
@@ -1409,6 +1864,7 @@ def make_train_step(
             dupe_start=args.dupe_layers_start,
             dupe_end=args.dupe_layers_end,
             dupe_loops=args.dupe_loops,
+            num_iterations=num_iterations,
         )
         return loss, metrics
 
@@ -1467,7 +1923,13 @@ def make_train_step(
     return train_step
 
 
-def make_eval_step(model_static: GPT, batch_sharding: NamedSharding, dupe_enabled: bool):
+def make_eval_step(
+    model_static: GPT,
+    batch_sharding: NamedSharding,
+    dupe_enabled: bool,
+    num_iterations: int,
+    allow_extra_iterations: bool = False,
+):
     @eqx.filter_jit
     def eval_step(
         params: PyTree[Float[Array, "..."]],
@@ -1488,6 +1950,8 @@ def make_eval_step(model_static: GPT, batch_sharding: NamedSharding, dupe_enable
             dupe_start=args.dupe_layers_start,
             dupe_end=args.dupe_layers_end,
             dupe_loops=args.dupe_loops,
+            num_iterations=num_iterations,
+            allow_extra_iterations=allow_extra_iterations,
         )
         mask = y != -1
         num_bytes = jnp.take(token_bytes, jnp.maximum(y, 0))
@@ -1501,7 +1965,11 @@ def make_eval_step(model_static: GPT, batch_sharding: NamedSharding, dupe_enable
 
 
 def make_target_prob_step(
-    model_static: GPT, batch_sharding: NamedSharding, dupe_enabled: bool
+    model_static: GPT,
+    batch_sharding: NamedSharding,
+    dupe_enabled: bool,
+    num_iterations: int,
+    allow_extra_iterations: bool = False,
 ):
     @eqx.filter_jit
     def target_prob_step(
@@ -1520,6 +1988,8 @@ def make_target_prob_step(
             dupe_start=args.dupe_layers_start,
             dupe_end=args.dupe_layers_end,
             dupe_loops=args.dupe_loops,
+            num_iterations=num_iterations,
+            allow_extra_iterations=allow_extra_iterations,
         )
         flat_logits = logits.reshape(-1, logits.shape[-1])
         flat_y = y.reshape(-1)
@@ -1553,8 +2023,7 @@ def evaluate_bpb(
 ) -> tuple[float, float]:
     val_loader = build_val_loader()
     totals: (
-        tuple[Float[Array, ""], Int[Array, ""], Float[Array, ""], Int[Array, ""]]
-        | None
+        tuple[Float[Array, ""], Int[Array, ""], Float[Array, ""], Int[Array, ""]] | None
     ) = None
     for _ in range(steps):
         x, y, _ = next(val_loader)
@@ -1677,6 +2146,19 @@ print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM
 print0(
     f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}, compute_dtype={args.compute_dtype}"
 )
+print0(f"  max_num_iterations={NUM_ITERATIONS}, hira_rank={args.hira_rank}")
+print0(f"  train_backprop_iterations={TRAIN_BACKPROP_ITERATIONS}")
+print0(
+    f"  iteration_schedule={args.iteration_schedule} "
+    f"({format_iteration_schedule(ITERATION_SCHEDULE)}), "
+    f"avg_layer_passes={DEPTH * ITERATION_SCHEDULE.avg_iterations:.3f}, "
+    f"avg_compute_equiv_layers={DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE:.3f}"
+)
+print0(
+    f"  compute_reference_n_embd={args.compute_reference_n_embd}, "
+    f"compute_width_power={args.compute_width_power}, "
+    f"compute_width_scale={COMPUTE_WIDTH_SCALE:.3f}"
+)
 print0(f"  stoch_depth={args.stoch_depth}")
 print0(
     f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}"
@@ -1723,6 +2205,8 @@ config = GPTConfig(
     window_pattern=WINDOW_PATTERN,
     dropout=args.dropout,
     stoch_depth=args.stoch_depth,
+    num_iterations=NUM_ITERATIONS,
+    hira_rank=args.hira_rank,
     use_iha=args.iha,
     iha_mix_v=args.iha,
     mtp_weight=args.mtp_weight,
@@ -1732,7 +2216,9 @@ config = GPTConfig(
 
 dupe_can_activate = (
     not args.eval_logit_avg
-) and args.dupe_start_epoch <= args.num_epochs
+    and args.dupe_start_epoch is not None
+    and args.dupe_start_epoch <= args.num_epochs
+)
 if dupe_can_activate:
     if args.dupe_layers_start < config.n_layer // 2:
         raise ValueError("dupe layers must be decoder-only")
@@ -1747,10 +2233,19 @@ opt_state = init_optimizer_state(params, opt_specs)
 state = TrainState(params, opt_state, train_key, jnp.asarray(0, dtype=jnp.int32))
 
 param_counts = tree_sum(params)
-num_flops_per_token = model.estimate_flops()
+max_flops_per_token = model.estimate_flops(NUM_ITERATIONS)
+scheduled_iteration_counts = iteration_schedule_counts(ITERATION_SCHEDULE)
+schedule_flops_per_token = {
+    count: model.estimate_flops(count) for count in scheduled_iteration_counts
+}
+avg_flops_per_token = sum(
+    (stage.end_frac - stage.start_frac) * schedule_flops_per_token[stage.iterations]
+    for stage in ITERATION_SCHEDULE.stages
+)
 accelerator_kind, peak_bf16_flops_per_chip = detect_peak_bf16_flops_per_chip()
 print0(f"Parameters: {param_counts:,}")
-print0(f"FLOPs per token: {num_flops_per_token:e}")
+print0(f"FLOPs per token at max iterations: {max_flops_per_token:e}")
+print0(f"Schedule-average FLOPs per token: {avg_flops_per_token:e}")
 if peak_bf16_flops_per_chip is not None:
     total_peak_tflops = peak_bf16_flops_per_chip * jax.device_count() / 1e12
     print0(
@@ -1805,6 +2300,13 @@ eval_steps = max(1, EVAL_TOKENS // (tokens_per_fwdbwd))
 
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
+print0(f"Recurrent iteration schedule: {format_iteration_schedule(ITERATION_SCHEDULE)}")
+for stage in ITERATION_SCHEDULE.stages:
+    print0(
+        f"  stage {stage.start_frac:.3f}-{stage.end_frac:.3f} of epochs "
+        f"(~steps {round(stage.start_frac * num_iterations)}-"
+        f"{round(stage.end_frac * num_iterations)}): {stage.iterations} iteration(s)"
+    )
 print0(f"Eval set: {EVAL_TOKENS:,} tokens ({eval_steps} step(s))")
 
 
@@ -1839,14 +2341,59 @@ def get_wd_multiplier(it: int) -> float:
     return 1.0 - (1.0 - WD_SWA_LOW_FACTOR) * decay_frac
 
 
+def make_step_bundles(dupe_enabled: bool):
+    train_steps = {
+        count: make_train_step(
+            model_static,
+            opt_specs,
+            grad_accum_steps,
+            microbatch_sharding,
+            dupe_enabled,
+            count,
+        )
+        for count in scheduled_iteration_counts
+    }
+    eval_step_cache: dict[tuple[int, bool], Any] = {}
+    target_prob_step_cache: dict[tuple[int, bool], Any] = {}
+    return train_steps, eval_step_cache, target_prob_step_cache
+
+
+def get_eval_step(
+    cache: dict[tuple[int, bool], Any],
+    dupe_enabled: bool,
+    count: int,
+    allow_extra_iterations: bool = False,
+):
+    key = (count, allow_extra_iterations)
+    if key not in cache:
+        cache[key] = make_eval_step(
+            model_static, batch_sharding, dupe_enabled, count, allow_extra_iterations
+        )
+    return cache[key]
+
+
+def get_target_prob_step(
+    cache: dict[tuple[int, bool], Any],
+    dupe_enabled: bool,
+    count: int,
+    allow_extra_iterations: bool = False,
+):
+    key = (count, allow_extra_iterations)
+    if key not in cache:
+        cache[key] = make_target_prob_step(
+            model_static, batch_sharding, dupe_enabled, count, allow_extra_iterations
+        )
+    return cache[key]
+
+
 dupe_active = False
-train_step = make_train_step(
-    model_static, opt_specs, grad_accum_steps, microbatch_sharding, dupe_active
-)
-eval_step = make_eval_step(model_static, batch_sharding, dupe_active)
+train_steps, eval_step_cache, target_prob_step_cache = make_step_bundles(dupe_active)
 
 step = 0
 current_epoch = train_loader.epoch
+active_num_iterations = get_scheduled_iterations(
+    ITERATION_SCHEDULE, step, num_iterations
+)
 min_val_bpb = float("inf")
 min_val_loss = float("inf")
 val_loss = float("inf")
@@ -1858,11 +2405,6 @@ timing_start_step = 4
 
 late_checkpoint_paths: list[str] = []
 logit_avg_count = args.logit_avg
-target_prob_step = (
-    make_target_prob_step(model_static, batch_sharding, dupe_active)
-    if logit_avg_count > 0
-    else None
-)
 if logit_avg_count > 0 and master_process:
     os.makedirs(args.logit_avg_dir, exist_ok=True)
 if logit_avg_count > 0:
@@ -1873,6 +2415,7 @@ if logit_avg_count > 0:
 if args.eval_logit_avg:
     print0("--eval-logit-avg set: skipping training, loading checkpoints from disk.")
 else:
+    eval_step = get_eval_step(eval_step_cache, dupe_active, active_num_iterations)
     val_bpb, val_loss = evaluate_bpb(
         state.params,
         build_val_loader,
@@ -1882,23 +2425,46 @@ else:
         batch_sharding,
         global_batch_size,
     )
-    print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-    wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+    print0(
+        f"Step {step:05d} | Val BPB: {val_bpb:.6f} | "
+        f"Val Loss: {val_loss:.6f} | iters: {active_num_iterations}"
+    )
+    wandb_run.log(
+        {
+            "step": step,
+            "val/bpb": val_bpb,
+            "val/loss": val_loss,
+            "val/num_iterations": active_num_iterations,
+        }
+    )
     min_val_bpb = val_bpb
     min_val_loss = val_loss
 
 while not args.eval_logit_avg and current_epoch <= args.num_epochs:
-    if not dupe_active and current_epoch >= args.dupe_start_epoch:
+    next_num_iterations = get_scheduled_iterations(
+        ITERATION_SCHEDULE, step, num_iterations
+    )
+    if next_num_iterations != active_num_iterations:
+        active_num_iterations = next_num_iterations
+        approx_epoch = step / steps_per_epoch if steps_per_epoch > 0 else 0.0
+        print0(
+            f"\n=== Recurrent iterations -> {active_num_iterations} "
+            f"at step {step} ({100 * step / num_iterations:.2f}%, "
+            f"epoch progress {approx_epoch:.2f}/{args.num_epochs}) ==="
+        )
+        timing_start_step = step + 4
+        gc.collect()
+
+    if (
+        not dupe_active
+        and args.dupe_start_epoch is not None
+        and current_epoch >= args.dupe_start_epoch
+    ):
         print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
         dupe_active = True
-        train_step = make_train_step(
-            model_static, opt_specs, grad_accum_steps, microbatch_sharding, dupe_active
+        train_steps, eval_step_cache, target_prob_step_cache = make_step_bundles(
+            dupe_active
         )
-        eval_step = make_eval_step(model_static, batch_sharding, dupe_active)
-        if target_prob_step is not None:
-            target_prob_step = make_target_prob_step(
-                model_static, batch_sharding, dupe_active
-            )
         timing_start_step = step + 4
         gc.collect()
 
@@ -1926,6 +2492,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             / 2
         )
     wdm = get_wd_multiplier(step)
+    train_step = train_steps[active_num_iterations]
     state, metrics = train_step(
         state,
         xs,
@@ -1947,7 +2514,9 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     tokens_per_second = TOTAL_BATCH_SIZE / dt
     tok_per_sec = int(tokens_per_second)
     bf16_mfu = compute_bf16_mfu_percent(
-        num_flops_per_token, tokens_per_second, peak_bf16_flops_per_chip
+        schedule_flops_per_token[active_num_iterations],
+        tokens_per_second,
+        peak_bf16_flops_per_chip,
     )
     mfu_str = f" | bf16_mfu: {bf16_mfu:.2f}%" if bf16_mfu is not None else ""
     if step >= timing_start_step:
@@ -1960,9 +2529,11 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     )
     dupe_str = " [DUPE]" if dupe_active else ""
     print0(
-        f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt * 1000:.2f}ms | "
+        f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | "
+        f"iters: {active_num_iterations} | dt: {dt * 1000:.2f}ms | "
         f"tok/sec: {tok_per_sec:,}{mfu_str}{dupe_str}{eta_str}"
     )
+    train_backprop_iterations = min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations)
     log_data = {
         "step": step,
         "train/loss": debiased,
@@ -1971,12 +2542,21 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         "train/lr_mult": lrm,
         "train/wd_mult": wdm,
         "train/tok_per_sec": tokens_per_second,
+        "train/num_iterations": active_num_iterations,
+        "train/backprop_iterations": train_backprop_iterations,
+        "train/effective_layers": DEPTH * active_num_iterations,
+        "train/backprop_layers": DEPTH * train_backprop_iterations,
+        "train/flops_per_token": schedule_flops_per_token[active_num_iterations],
     }
     if bf16_mfu is not None:
         log_data["train/bf16_mfu"] = bf16_mfu
     wandb_run.log(log_data)
 
     if epoch != current_epoch:
+        eval_num_iterations = get_scheduled_iterations(
+            ITERATION_SCHEDULE, step, num_iterations
+        )
+        eval_step = get_eval_step(eval_step_cache, dupe_active, eval_num_iterations)
         val_bpb, val_loss = evaluate_bpb(
             state.params,
             build_val_loader,
@@ -1987,7 +2567,9 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             global_batch_size,
         )
         print0(
-            f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}"
+            f"Step {step:05d} | Epoch {current_epoch} | "
+            f"Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} "
+            f"| iters: {eval_num_iterations}"
         )
         wandb_run.log(
             {
@@ -1995,6 +2577,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
                 "epoch": current_epoch,
                 "val/bpb": val_bpb,
                 "val/loss": val_loss,
+                "val/num_iterations": eval_num_iterations,
             }
         )
         if val_bpb < min_val_bpb:
@@ -2031,6 +2614,9 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
 # Post-training: evaluate checkpoint averages
 # =============================================================================
 
+final_extra_iter_result = None
+final_iteration_eval_results: list[dict[str, Any]] = []
+
 if logit_avg_count > 0:
     if args.eval_logit_avg:
         all_disk = sorted(glob.glob(os.path.join(args.logit_avg_dir, "epoch_*.eqx")))
@@ -2039,14 +2625,27 @@ if logit_avg_count > 0:
         ckpt_paths_for_logit = late_checkpoint_paths
 
     if len(ckpt_paths_for_logit) >= 2:
-        assert target_prob_step is not None
         n = len(ckpt_paths_for_logit)
+        logit_avg_num_iterations = ITERATION_SCHEDULE.stages[-1].iterations
         print0(
-            f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---"
+            f"\n--- Evaluating logit avg ({n} checkpoints: "
+            f"{[os.path.basename(p) for p in ckpt_paths_for_logit]}, "
+            f"iters={logit_avg_num_iterations}) ---"
         )
 
-        def _run_mode(label: str, weights: list[float]) -> tuple[float, float]:
+        def _run_mode(
+            label: str,
+            weights: list[float],
+            eval_num_iterations: int,
+            allow_extra_iterations: bool = False,
+        ) -> tuple[float, float]:
             print0(f"  [{label}] weights: {[f'{w:.3f}' for w in weights]}")
+            target_prob_step = get_target_prob_step(
+                target_prob_step_cache,
+                dupe_active,
+                eval_num_iterations,
+                allow_extra_iterations,
+            )
             bpb, loss = evaluate_bpb_logit_avg(
                 model_static,
                 state.params,
@@ -2059,27 +2658,120 @@ if logit_avg_count > 0:
                 batch_sharding,
                 global_batch_size,
             )
-            print0(f"  [{label}] Val BPB: {bpb:.6f} | Val Loss: {loss:.6f}")
+            print0(
+                f"  [{label}] Val BPB: {bpb:.6f} | Val Loss: {loss:.6f} "
+                f"| iters: {eval_num_iterations}"
+            )
             wandb_run.log(
-                {f"logit_avg_{label}/bpb": bpb, f"logit_avg_{label}/loss": loss}
+                {
+                    f"logit_avg_{label}/bpb": bpb,
+                    f"logit_avg_{label}/loss": loss,
+                    f"logit_avg_{label}/num_iterations": eval_num_iterations,
+                }
             )
             return bpb, loss
 
         equal_w = [1.0 / n] * n
         raw_w = list(range(1, n + 1))
         weighted_w = [w / sum(raw_w) for w in raw_w]
+        best_logit_avg = {
+            "label": None,
+            "weights": None,
+            "bpb": float("inf"),
+            "loss": float("inf"),
+        }
 
         if args.logit_avg_mode in ("equal", "both"):
-            eq_bpb, eq_loss = _run_mode("equal", equal_w)
+            eq_bpb, eq_loss = _run_mode("equal", equal_w, logit_avg_num_iterations)
+            if eq_loss < best_logit_avg["loss"]:
+                best_logit_avg.update(
+                    label="equal", weights=list(equal_w), bpb=eq_bpb, loss=eq_loss
+                )
             if eq_loss < min_val_loss:
                 min_val_loss, min_val_bpb = eq_loss, eq_bpb
                 print0("  ** New best! (logit avg equal weights)")
 
         if args.logit_avg_mode in ("weighted", "both"):
-            wt_bpb, wt_loss = _run_mode("weighted", weighted_w)
+            wt_bpb, wt_loss = _run_mode(
+                "weighted", weighted_w, logit_avg_num_iterations
+            )
+            if wt_loss < best_logit_avg["loss"]:
+                best_logit_avg.update(
+                    label="weighted",
+                    weights=list(weighted_w),
+                    bpb=wt_bpb,
+                    loss=wt_loss,
+                )
             if wt_loss < min_val_loss:
                 min_val_loss, min_val_bpb = wt_loss, wt_bpb
                 print0("  ** New best! (logit avg recency weights)")
+
+        if best_logit_avg["weights"] is not None:
+            best_source = f"logit_avg_{best_logit_avg['label']}"
+            minus_one_num_iterations = max(1, logit_avg_num_iterations - 1)
+            if minus_one_num_iterations != logit_avg_num_iterations:
+                minus_one_label = f"{best_logit_avg['label']}_minus_1_iter"
+                print0(
+                    f"\n--- Re-evaluating best logit avg "
+                    f"({best_logit_avg['label']}, loss={best_logit_avg['loss']:.6f}) "
+                    f"at {minus_one_num_iterations} recurrent iterations (-1) ---"
+                )
+                minus_one_bpb, minus_one_loss = _run_mode(
+                    minus_one_label,
+                    best_logit_avg["weights"],
+                    minus_one_num_iterations,
+                )
+                final_iteration_eval_results.append(
+                    {
+                        "label": "n_minus_1",
+                        "source": best_source,
+                        "base_num_iterations": logit_avg_num_iterations,
+                        "num_iterations": minus_one_num_iterations,
+                        "bpb": minus_one_bpb,
+                        "loss": minus_one_loss,
+                    }
+                )
+
+            final_iteration_eval_results.append(
+                {
+                    "label": "n",
+                    "source": best_source,
+                    "base_num_iterations": logit_avg_num_iterations,
+                    "num_iterations": logit_avg_num_iterations,
+                    "bpb": best_logit_avg["bpb"],
+                    "loss": best_logit_avg["loss"],
+                }
+            )
+
+            extra_num_iterations = (
+                logit_avg_num_iterations + FINAL_EXTRA_EVAL_ITERATIONS
+            )
+            extra_label = (
+                f"{best_logit_avg['label']}_plus_{FINAL_EXTRA_EVAL_ITERATIONS}_iter"
+            )
+            print0(
+                f"\n--- Re-evaluating best logit avg "
+                f"({best_logit_avg['label']}, loss={best_logit_avg['loss']:.6f}) "
+                f"at {extra_num_iterations} recurrent iterations "
+                f"(+{FINAL_EXTRA_EVAL_ITERATIONS}); "
+                "extra passes reuse the final trained HiRA adapter ---"
+            )
+            extra_bpb, extra_loss = _run_mode(
+                extra_label,
+                best_logit_avg["weights"],
+                extra_num_iterations,
+                allow_extra_iterations=True,
+            )
+            final_extra_iter_result = {
+                "label": f"n_plus_{FINAL_EXTRA_EVAL_ITERATIONS}",
+                "source": best_source,
+                "base_num_iterations": logit_avg_num_iterations,
+                "extra_iterations": FINAL_EXTRA_EVAL_ITERATIONS,
+                "num_iterations": extra_num_iterations,
+                "bpb": extra_bpb,
+                "loss": extra_loss,
+            }
+            final_iteration_eval_results.append(final_extra_iter_result)
 
 
 print0(f"Total training time: {total_training_time / 60:.2f}m")
@@ -2087,8 +2779,27 @@ final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float("i
 print0(f"Final train loss: {final_train_loss:.6f}")
 print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
+if final_iteration_eval_results:
+    print0("Final logit-avg iteration evals:")
+    for eval_result in final_iteration_eval_results:
+        print0(
+            f"  {eval_result['label']} "
+            f"({eval_result['source']}, {eval_result['num_iterations']} iters) "
+            f"BPB: {eval_result['bpb']:.6f} | "
+            f"Loss: {eval_result['loss']:.6f}"
+        )
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
+if final_extra_iter_result is not None:
+    wandb_run.summary["final_extra_iter_eval_loss"] = final_extra_iter_result["loss"]
+    wandb_run.summary["final_extra_iter_eval_bpb"] = final_extra_iter_result["bpb"]
+for eval_result in final_iteration_eval_results:
+    summary_prefix = f"final_iteration_eval/{eval_result['label']}"
+    wandb_run.summary[f"{summary_prefix}_loss"] = eval_result["loss"]
+    wandb_run.summary[f"{summary_prefix}_bpb"] = eval_result["bpb"]
+    wandb_run.summary[f"{summary_prefix}_num_iterations"] = eval_result[
+        "num_iterations"
+    ]
 
 _result_out = args.save_result or result_path
 if master_process:
@@ -2096,12 +2807,35 @@ if master_process:
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "max_num_iterations": NUM_ITERATIONS,
+        "train_backprop_iterations": TRAIN_BACKPROP_ITERATIONS,
+        "iteration_schedule": args.iteration_schedule,
+        "iteration_schedule_stages": [
+            {
+                "start_frac": stage.start_frac,
+                "end_frac": stage.end_frac,
+                "iterations": stage.iterations,
+            }
+            for stage in ITERATION_SCHEDULE.stages
+        ],
+        "avg_effective_layers": DEPTH * ITERATION_SCHEDULE.avg_iterations,
+        "avg_effective_layer_passes": DEPTH * ITERATION_SCHEDULE.avg_iterations,
+        "avg_compute_equivalent_layers": (
+            DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE
+        ),
+        "compute_reference_n_embd": args.compute_reference_n_embd,
+        "compute_width_power": args.compute_width_power,
+        "compute_width_scale": COMPUTE_WIDTH_SCALE,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
         "jax_devices": jax.device_count(),
         "compute_dtype": args.compute_dtype,
     }
+    if final_extra_iter_result is not None:
+        result["final_extra_iter_eval"] = final_extra_iter_result
+    if final_iteration_eval_results:
+        result["final_iteration_evals"] = final_iteration_eval_results
     with open(_result_out, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
     print0(f"Result saved to {_result_out}")
