@@ -79,7 +79,7 @@ parser.add_argument("--lr_multiplier", type=float, default=0.25)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
-parser.add_argument("--wandb_group", type=str, default=None)
+parser.add_argument("--wandb_group", type=str, default="main")
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument(
     "--dupe-start-epoch", type=int, default=7, help="Epoch to enable layer duplication"
