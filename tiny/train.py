@@ -1888,7 +1888,7 @@ def make_train_step(
         )
         return loss, metrics
 
-    @eqx.filter_jit(donate="all")
+    @eqx.filter_jit(donate="all-except-first")
     def train_step(
         state: TrainState,
         xs: Int[Array, "microbatch batch seq"],
