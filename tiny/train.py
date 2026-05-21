@@ -105,8 +105,12 @@ parser.add_argument(
 parser.add_argument(
     "--compute-equivalent-layers",
     type=float,
-    default=30.0,
-    help="Target average baseline-width-equivalent layer-passes per token",
+    default=None,
+    help=(
+        "Target average baseline-width-equivalent layer-passes per token. "
+        "Defaults to COMPUTE_REFERENCE_N_LAYER when feasible, otherwise the "
+        "closest feasible target for the current depth/width/iteration cap."
+    ),
 )
 parser.add_argument(
     "--compute-reference-n-embd",
@@ -288,6 +292,7 @@ NUM_ITERATIONS = args.num_iterations
 DEPTH = args.n_layer
 N_EMBD = args.n_embd
 N_HEAD = args.n_head
+COMPUTE_REFERENCE_N_LAYER = 12.0
 assert N_EMBD % N_HEAD == 0, "n_embd must be divisible by n_head"
 HEAD_DIM = N_EMBD // N_HEAD
 assert HEAD_DIM % 2 == 0, "RoPE requires an even head_dim"
@@ -297,6 +302,23 @@ if args.compute_reference_n_embd <= 0:
 COMPUTE_WIDTH_SCALE = (
     N_EMBD / args.compute_reference_n_embd
 ) ** args.compute_width_power
+_COMPUTE_EQUIVALENT_LAYERS_EXPLICIT = any(
+    arg == "--compute-equivalent-layers"
+    or arg.startswith("--compute-equivalent-layers=")
+    for arg in sys.argv[1:]
+)
+COMPUTE_EQUIVALENT_LAYERS = (
+    COMPUTE_REFERENCE_N_LAYER
+    if args.compute_equivalent_layers is None
+    else float(args.compute_equivalent_layers)
+)
+if not _COMPUTE_EQUIVALENT_LAYERS_EXPLICIT:
+    min_compute_equivalent_layers = DEPTH * args.min_iterations * COMPUTE_WIDTH_SCALE
+    max_compute_equivalent_layers = DEPTH * NUM_ITERATIONS * COMPUTE_WIDTH_SCALE
+    COMPUTE_EQUIVALENT_LAYERS = min(
+        max(COMPUTE_EQUIVALENT_LAYERS, min_compute_equivalent_layers),
+        max_compute_equivalent_layers,
+    )
 MAX_SEQ_LEN = args.sequence_length
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -547,7 +569,7 @@ ITERATION_SCHEDULE = build_iteration_schedule(
     args.min_iterations,
     NUM_ITERATIONS,
     DEPTH,
-    args.compute_equivalent_layers,
+    COMPUTE_EQUIVALENT_LAYERS,
     COMPUTE_WIDTH_SCALE,
     WARMDOWN_RATIO,
 )
@@ -2218,7 +2240,9 @@ print0(
     f"avg_compute_equiv_layers={DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE:.3f}"
 )
 print0(
-    f"  compute_reference_n_embd={args.compute_reference_n_embd}, "
+    f"  compute_equivalent_layers={COMPUTE_EQUIVALENT_LAYERS:.3f}, "
+    f"compute_reference_n_layer={COMPUTE_REFERENCE_N_LAYER}, "
+    f"compute_reference_n_embd={args.compute_reference_n_embd}, "
     f"compute_width_power={args.compute_width_power}, "
     f"compute_width_scale={COMPUTE_WIDTH_SCALE:.3f}"
 )
@@ -2963,6 +2987,8 @@ if master_process:
         "avg_compute_equivalent_layers": (
             DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE
         ),
+        "compute_equivalent_layers": COMPUTE_EQUIVALENT_LAYERS,
+        "compute_reference_n_layer": COMPUTE_REFERENCE_N_LAYER,
         "compute_reference_n_embd": args.compute_reference_n_embd,
         "compute_width_power": args.compute_width_power,
         "compute_width_scale": COMPUTE_WIDTH_SCALE,
