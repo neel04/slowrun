@@ -79,45 +79,6 @@ parser.add_argument(
     default=3,
     help="Maximum recurrent iterations through the network",
 )
-parser.add_argument(
-    "--iteration-schedule",
-    type=str,
-    default="constant",
-    choices=["constant", "compute-matched"],
-    help=(
-        "Schedule recurrent iterations over training. "
-        "'compute-matched' ramps from --min-iterations through each integer stage "
-        "to --num-iterations so average layer-passes match --compute-equivalent-layers."
-    ),
-)
-parser.add_argument(
-    "--min-iterations",
-    type=int,
-    default=1,
-    help="Initial recurrent iterations for --iteration-schedule compute-matched",
-)
-parser.add_argument(
-    "--compute-equivalent-layers",
-    type=float,
-    default=None,
-    help=(
-        "Target average baseline-width-equivalent layer-passes per token. "
-        "Defaults to COMPUTE_REFERENCE_N_LAYER when feasible, otherwise the "
-        "closest feasible target for the current depth/width/iteration cap."
-    ),
-)
-parser.add_argument(
-    "--compute-reference-n-embd",
-    type=float,
-    default=1792.0,
-    help="Reference model width used by --compute-equivalent-layers",
-)
-parser.add_argument(
-    "--compute-width-power",
-    type=float,
-    default=2.0,
-    help="Width scaling exponent for compute matching; dense matmuls are ~2.0",
-)
 parser.add_argument("--n_head", type=int, default=14)
 parser.add_argument("--n_embd", type=int, default=1792)
 parser.add_argument("--lr_multiplier", type=float, default=0.25)
@@ -284,32 +245,9 @@ NUM_ITERATIONS = args.num_iterations
 DEPTH = args.n_layer
 N_EMBD = args.n_embd
 N_HEAD = args.n_head
-COMPUTE_REFERENCE_N_LAYER = 30.0
 assert N_EMBD % N_HEAD == 0, "n_embd must be divisible by n_head"
 HEAD_DIM = N_EMBD // N_HEAD
 assert HEAD_DIM % 2 == 0, "RoPE requires an even head_dim"
-if args.compute_reference_n_embd <= 0:
-    raise ValueError("--compute-reference-n-embd must be > 0")
-COMPUTE_WIDTH_SCALE = (
-    N_EMBD / args.compute_reference_n_embd
-) ** args.compute_width_power
-_COMPUTE_EQUIVALENT_LAYERS_EXPLICIT = any(
-    arg == "--compute-equivalent-layers"
-    or arg.startswith("--compute-equivalent-layers=")
-    for arg in sys.argv[1:]
-)
-COMPUTE_EQUIVALENT_LAYERS = (
-    COMPUTE_REFERENCE_N_LAYER
-    if args.compute_equivalent_layers is None
-    else float(args.compute_equivalent_layers)
-)
-if not _COMPUTE_EQUIVALENT_LAYERS_EXPLICIT:
-    min_compute_equivalent_layers = DEPTH * args.min_iterations * COMPUTE_WIDTH_SCALE
-    max_compute_equivalent_layers = DEPTH * NUM_ITERATIONS * COMPUTE_WIDTH_SCALE
-    COMPUTE_EQUIVALENT_LAYERS = min(
-        max(COMPUTE_EQUIVALENT_LAYERS, min_compute_equivalent_layers),
-        max_compute_equivalent_layers,
-    )
 MAX_SEQ_LEN = args.sequence_length
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -406,168 +344,6 @@ class TeeStream:
 
     def fileno(self):
         return self.streams[0].fileno()
-
-
-@dataclass(frozen=True)
-class IterationScheduleStage:
-    start_frac: float
-    end_frac: float
-    iterations: int
-
-
-@dataclass(frozen=True)
-class IterationSchedule:
-    stages: tuple[IterationScheduleStage, ...]
-    avg_iterations: float
-    target_effective_layers: float
-    width_compute_scale: float
-
-
-def build_iteration_schedule(
-    schedule_name: str,
-    min_iterations: int,
-    max_iterations: int,
-    n_layer: int,
-    target_effective_layers: float,
-    width_compute_scale: float,
-    warmdown_ratio: float,
-) -> IterationSchedule:
-    if max_iterations < 1:
-        raise ValueError("--num-iterations must be >= 1")
-    if min_iterations < 1:
-        raise ValueError("--min-iterations must be >= 1")
-    if min_iterations > max_iterations:
-        raise ValueError("--min-iterations must be <= --num-iterations")
-    if n_layer <= 0:
-        raise ValueError("--n_layer must be > 0")
-    if width_compute_scale <= 0:
-        raise ValueError("width_compute_scale must be > 0")
-
-    if schedule_name == "constant":
-        avg_iterations = float(max_iterations)
-        return IterationSchedule(
-            stages=(IterationScheduleStage(0.0, 1.0, max_iterations),),
-            avg_iterations=avg_iterations,
-            target_effective_layers=n_layer * avg_iterations * width_compute_scale,
-            width_compute_scale=width_compute_scale,
-        )
-
-    target_iterations = target_effective_layers / (n_layer * width_compute_scale)
-    if target_iterations < min_iterations or target_iterations > max_iterations:
-        raise ValueError(
-            "--compute-equivalent-layers requires an average of "
-            f"{target_iterations:.3f} iterations for n_layer={n_layer} "
-            f"and width_compute_scale={width_compute_scale:.3f}, outside "
-            f"[--min-iterations={min_iterations}, --num-iterations={max_iterations}]"
-        )
-
-    if min_iterations == max_iterations:
-        if abs(target_iterations - max_iterations) > 1e-9:
-            raise ValueError(
-                "Cannot compute-match with equal min/max iterations unless the "
-                "target equals that iteration count"
-            )
-        return IterationSchedule(
-            stages=(IterationScheduleStage(0.0, 1.0, max_iterations),),
-            avg_iterations=float(max_iterations),
-            target_effective_layers=target_effective_layers,
-            width_compute_scale=width_compute_scale,
-        )
-
-    warmdown_duration = min(max(warmdown_ratio, 0.0), 1.0)
-    extra_iterations = target_iterations - min_iterations
-    threshold_count = max_iterations - min_iterations
-    min_extra_with_max_before_warmdown = threshold_count * warmdown_duration
-    if extra_iterations < min_extra_with_max_before_warmdown - 1e-9:
-        warmdown_start_frac = 1.0 - warmdown_duration
-        raise ValueError(
-            "Compute-matched schedule cannot reach --num-iterations by warmdown "
-            f"start ({warmdown_start_frac:.3f}) without exceeding the compute "
-            f"target. Minimum average iterations would be "
-            f"{min_iterations + min_extra_with_max_before_warmdown:.3f}, "
-            f"but target is {target_iterations:.3f}."
-        )
-
-    suffix_durations = [warmdown_duration] * threshold_count
-    remaining_extra = extra_iterations - min_extra_with_max_before_warmdown
-    for i in range(threshold_count):
-        capacity = 1.0 - suffix_durations[i]
-        add = min(remaining_extra, capacity)
-        suffix_durations[i] += add
-        remaining_extra -= add
-        if remaining_extra <= 1e-9:
-            break
-    if remaining_extra > 1e-9:
-        raise ValueError(
-            "Could not build compute-matched iteration schedule; target average "
-            f"iterations {target_iterations:.3f} is too high"
-        )
-
-    durations = [1.0 - suffix_durations[0]]
-    for i in range(1, threshold_count):
-        durations.append(suffix_durations[i - 1] - suffix_durations[i])
-    durations.append(suffix_durations[-1])
-
-    stages: list[IterationScheduleStage] = []
-    start_frac = 0.0
-    for offset, duration in enumerate(durations):
-        if duration <= 1e-9:
-            continue
-        end_frac = min(1.0, start_frac + duration)
-        stages.append(
-            IterationScheduleStage(start_frac, end_frac, min_iterations + offset)
-        )
-        start_frac = end_frac
-    if stages:
-        stages[-1] = IterationScheduleStage(
-            stages[-1].start_frac, 1.0, stages[-1].iterations
-        )
-    else:
-        stages = [IterationScheduleStage(0.0, 1.0, max_iterations)]
-
-    avg_iterations = sum(
-        (stage.end_frac - stage.start_frac) * stage.iterations for stage in stages
-    )
-    return IterationSchedule(
-        stages=tuple(stages),
-        avg_iterations=avg_iterations,
-        target_effective_layers=target_effective_layers,
-        width_compute_scale=width_compute_scale,
-    )
-
-
-def get_scheduled_iterations(
-    schedule: IterationSchedule, step: int, total_steps: int
-) -> int:
-    if total_steps <= 0:
-        return schedule.stages[-1].iterations
-    frac = min(max(step / total_steps, 0.0), 1.0)
-    for stage in schedule.stages:
-        if frac < stage.end_frac or stage is schedule.stages[-1]:
-            return stage.iterations
-    return schedule.stages[-1].iterations
-
-
-def format_iteration_schedule(schedule: IterationSchedule) -> str:
-    return ", ".join(
-        f"{stage.start_frac:.3f}-{stage.end_frac:.3f}: {stage.iterations}x"
-        for stage in schedule.stages
-    )
-
-
-def iteration_schedule_counts(schedule: IterationSchedule) -> tuple[int, ...]:
-    return tuple(dict.fromkeys(stage.iterations for stage in schedule.stages))
-
-
-ITERATION_SCHEDULE = build_iteration_schedule(
-    args.iteration_schedule,
-    args.min_iterations,
-    NUM_ITERATIONS,
-    DEPTH,
-    COMPUTE_EQUIVALENT_LAYERS,
-    COMPUTE_WIDTH_SCALE,
-    WARMDOWN_RATIO,
-)
 
 
 def resolve_run_dir(run_name: str | None) -> tuple[str, str]:
@@ -2170,19 +1946,7 @@ print0(
 )
 print0(f"  max_num_iterations={NUM_ITERATIONS}, hira_rank={args.hira_rank}")
 print0(f"  train_backprop_iterations={TRAIN_BACKPROP_ITERATIONS}")
-print0(
-    f"  iteration_schedule={args.iteration_schedule} "
-    f"({format_iteration_schedule(ITERATION_SCHEDULE)}), "
-    f"avg_layer_passes={DEPTH * ITERATION_SCHEDULE.avg_iterations:.3f}, "
-    f"avg_compute_equiv_layers={DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE:.3f}"
-)
-print0(
-    f"  compute_equivalent_layers={COMPUTE_EQUIVALENT_LAYERS:.3f}, "
-    f"compute_reference_n_layer={COMPUTE_REFERENCE_N_LAYER}, "
-    f"compute_reference_n_embd={args.compute_reference_n_embd}, "
-    f"compute_width_power={args.compute_width_power}, "
-    f"compute_width_scale={COMPUTE_WIDTH_SCALE:.3f}"
-)
+print0(f"  train_num_iterations={NUM_ITERATIONS}")
 print0(f"  stoch_depth={args.stoch_depth}")
 print0(
     f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}"
@@ -2258,18 +2022,9 @@ state = TrainState(params, opt_state, train_key, jnp.asarray(0, dtype=jnp.int32)
 
 param_counts = tree_sum(params)
 max_flops_per_token = model.estimate_flops(NUM_ITERATIONS)
-scheduled_iteration_counts = iteration_schedule_counts(ITERATION_SCHEDULE)
-schedule_flops_per_token = {
-    count: model.estimate_flops(count) for count in scheduled_iteration_counts
-}
-avg_flops_per_token = sum(
-    (stage.end_frac - stage.start_frac) * schedule_flops_per_token[stage.iterations]
-    for stage in ITERATION_SCHEDULE.stages
-)
 accelerator_kind, peak_bf16_flops_per_chip = detect_peak_bf16_flops_per_chip()
 print0(f"Parameters: {param_counts:,}")
-print0(f"FLOPs per token at max iterations: {max_flops_per_token:e}")
-print0(f"Schedule-average FLOPs per token: {avg_flops_per_token:e}")
+print0(f"FLOPs per token: {max_flops_per_token:e}")
 if peak_bf16_flops_per_chip is not None:
     total_peak_tflops = peak_bf16_flops_per_chip * jax.device_count() / 1e12
     print0(
@@ -2324,13 +2079,7 @@ eval_steps = max(1, EVAL_TOKENS // (tokens_per_fwdbwd))
 
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
-print0(f"Recurrent iteration schedule: {format_iteration_schedule(ITERATION_SCHEDULE)}")
-for stage in ITERATION_SCHEDULE.stages:
-    print0(
-        f"  stage {stage.start_frac:.3f}-{stage.end_frac:.3f} of epochs "
-        f"(~steps {round(stage.start_frac * num_iterations)}-"
-        f"{round(stage.end_frac * num_iterations)}): {stage.iterations} iteration(s)"
-    )
+print0(f"Training recurrent iterations: {NUM_ITERATIONS}")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens ({eval_steps} step(s))")
 
 
@@ -2367,15 +2116,14 @@ def get_wd_multiplier(it: int) -> float:
 
 def make_step_bundles(dupe_enabled: bool):
     train_steps = {
-        count: make_train_step(
+        NUM_ITERATIONS: make_train_step(
             model_static,
             opt_specs,
             grad_accum_steps,
             microbatch_sharding,
             dupe_enabled,
-            count,
+            NUM_ITERATIONS,
         )
-        for count in scheduled_iteration_counts
     }
     eval_step_cache: dict[tuple[int, bool], Any] = {}
     target_prob_step_cache: dict[tuple[int, bool], Any] = {}
@@ -2415,9 +2163,7 @@ train_steps, eval_step_cache, target_prob_step_cache = make_step_bundles(dupe_ac
 
 step = 0
 current_epoch = train_loader.epoch
-active_num_iterations = get_scheduled_iterations(
-    ITERATION_SCHEDULE, step, num_iterations
-)
+active_num_iterations = NUM_ITERATIONS
 min_val_bpb = float("inf")
 min_val_loss = float("inf")
 val_loss = float("inf")
@@ -2465,20 +2211,6 @@ else:
     min_val_loss = val_loss
 
 while not args.eval_logit_avg and current_epoch <= args.num_epochs:
-    next_num_iterations = get_scheduled_iterations(
-        ITERATION_SCHEDULE, step, num_iterations
-    )
-    if next_num_iterations != active_num_iterations:
-        active_num_iterations = next_num_iterations
-        approx_epoch = step / steps_per_epoch if steps_per_epoch > 0 else 0.0
-        print0(
-            f"\n=== Recurrent iterations -> {active_num_iterations} "
-            f"at step {step} ({100 * step / num_iterations:.2f}%, "
-            f"epoch progress {approx_epoch:.2f}/{args.num_epochs}) ==="
-        )
-        timing_start_step = step + 4
-        gc.collect()
-
     if (
         not dupe_active
         and args.dupe_start_epoch is not None
@@ -2538,7 +2270,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     tokens_per_second = TOTAL_BATCH_SIZE / dt
     tok_per_sec = int(tokens_per_second)
     bf16_mfu = compute_bf16_mfu_percent(
-        schedule_flops_per_token[active_num_iterations],
+        max_flops_per_token,
         tokens_per_second,
         peak_bf16_flops_per_chip,
     )
@@ -2570,16 +2302,14 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         "train/backprop_iterations": train_backprop_iterations,
         "train/effective_layers": DEPTH * active_num_iterations,
         "train/backprop_layers": DEPTH * train_backprop_iterations,
-        "train/flops_per_token": schedule_flops_per_token[active_num_iterations],
+        "train/flops_per_token": max_flops_per_token,
     }
     if bf16_mfu is not None:
         log_data["train/bf16_mfu"] = bf16_mfu
     wandb_run.log(log_data)
 
     if epoch != current_epoch:
-        eval_num_iterations = get_scheduled_iterations(
-            ITERATION_SCHEDULE, step, num_iterations
-        )
+        eval_num_iterations = NUM_ITERATIONS
         eval_step = get_eval_step(eval_step_cache, dupe_active, eval_num_iterations)
         val_bpb, val_loss = evaluate_bpb(
             state.params,
@@ -2650,7 +2380,7 @@ if logit_avg_count > 0:
 
     if len(ckpt_paths_for_logit) >= 2:
         n = len(ckpt_paths_for_logit)
-        logit_avg_num_iterations = ITERATION_SCHEDULE.stages[-1].iterations
+        logit_avg_num_iterations = NUM_ITERATIONS
         print0(
             f"\n--- Evaluating logit avg ({n} checkpoints: "
             f"{[os.path.basename(p) for p in ckpt_paths_for_logit]}, "
@@ -2833,25 +2563,9 @@ if master_process:
         "num_epochs": args.num_epochs,
         "max_num_iterations": NUM_ITERATIONS,
         "train_backprop_iterations": TRAIN_BACKPROP_ITERATIONS,
-        "iteration_schedule": args.iteration_schedule,
-        "iteration_schedule_stages": [
-            {
-                "start_frac": stage.start_frac,
-                "end_frac": stage.end_frac,
-                "iterations": stage.iterations,
-            }
-            for stage in ITERATION_SCHEDULE.stages
-        ],
-        "avg_effective_layers": DEPTH * ITERATION_SCHEDULE.avg_iterations,
-        "avg_effective_layer_passes": DEPTH * ITERATION_SCHEDULE.avg_iterations,
-        "avg_compute_equivalent_layers": (
-            DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE
-        ),
-        "compute_equivalent_layers": COMPUTE_EQUIVALENT_LAYERS,
-        "compute_reference_n_layer": COMPUTE_REFERENCE_N_LAYER,
-        "compute_reference_n_embd": args.compute_reference_n_embd,
-        "compute_width_power": args.compute_width_power,
-        "compute_width_scale": COMPUTE_WIDTH_SCALE,
+        "train_num_iterations": NUM_ITERATIONS,
+        "avg_effective_layers": DEPTH * NUM_ITERATIONS,
+        "avg_effective_layer_passes": DEPTH * NUM_ITERATIONS,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
