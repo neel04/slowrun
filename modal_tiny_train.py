@@ -30,8 +30,7 @@ if not DATA_DIR.exists():
         f"Expected local training data at {DATA_DIR}. Run prepare_data.py first."
     )
 
-run_volume = modal.Volume.from_name("slowrun-tiny-runs", create_if_missing=True)
-secrets = [modal.Secret.from_dotenv(REPO_ROOT)] if (REPO_ROOT / ".env").exists() else []
+secrets = [modal.Secret.from_dotenv(REPO_ROOT)]
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -55,8 +54,7 @@ app = modal.App(APP_NAME)
 @app.function(
     image=image,
     gpu="H100:8",
-    timeout=12 * 60 * 60,
-    volumes={str(REMOTE_ROOT / "runs"): run_volume},
+    timeout=2 * 60 * 60,
     secrets=secrets,
 )
 def run_tiny_train(train_args: str = "") -> int:
@@ -69,12 +67,11 @@ def run_tiny_train(train_args: str = "") -> int:
     ]
 
     env = os.environ.copy()
-    if "WANDB_API_KEY" not in env and "WANDB_MODE" not in env:
-        env["WANDB_MODE"] = "offline"
+    env["WANDB_MODE"] = "online"
+    env["WANDB_DISABLED"] = "false"
 
     print("Running:", shlex.join(cmd), flush=True)
     result = subprocess.run(cmd, cwd=REMOTE_ROOT, env=env, check=False)
-    run_volume.commit()
     if result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, cmd)
     return result.returncode

@@ -59,7 +59,16 @@ parser.add_argument("--wd-end", type=float, default=1.25)
 parser.add_argument("--warmdown-ratio", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n_layer", type=int, default=16)
+parser.add_argument(
+    "--n_layer",
+    type=int,
+    default=None,
+    help=(
+        "Number of recurrent body layers. Defaults to 16 for constant training, "
+        "or a compute-matched depth derived from --compute-equivalent-layers "
+        "and --num-iterations for --iteration-schedule compute-matched."
+    ),
+)
 parser.add_argument(
     "--num-iterations",
     type=int,
@@ -129,17 +138,35 @@ if args.output_json and not args.save_result:
 # Hyperparameters
 # =============================================================================
 
+TINY_BASELINE_LAYERS = 16
+
 # RLM
 NUM_ITERATIONS = args.num_iterations
 
 # Architecture
-DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
 if args.compute_reference_n_embd <= 0:
     raise ValueError("--compute-reference-n-embd must be > 0")
 COMPUTE_WIDTH_SCALE = (N_EMBD / args.compute_reference_n_embd) ** args.compute_width_power
+COMPUTE_EQUIVALENT_LAYERS = args.compute_equivalent_layers
+if NUM_ITERATIONS < 1:
+    raise ValueError("--num-iterations must be >= 1")
+if COMPUTE_EQUIVALENT_LAYERS <= 0:
+    raise ValueError("--compute-equivalent-layers must be > 0")
+if args.n_layer is None:
+    if args.iteration_schedule == "compute-matched":
+        DEPTH = max(
+            1,
+            math.ceil(
+                COMPUTE_EQUIVALENT_LAYERS / (NUM_ITERATIONS * COMPUTE_WIDTH_SCALE)
+            ),
+        )
+    else:
+        DEPTH = TINY_BASELINE_LAYERS
+else:
+    DEPTH = args.n_layer
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -168,8 +195,6 @@ WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
 FINAL_EXTRA_EVAL_ITERATIONS = 2
 TRAIN_BACKPROP_ITERATIONS = 1
-if NUM_ITERATIONS < 1:
-    raise ValueError("--num-iterations must be >= 1")
 if args.hira_rank < 0:
     raise ValueError("--hira-rank must be >= 0")
 if TRAIN_BACKPROP_ITERATIONS < 1:
@@ -343,7 +368,7 @@ ITERATION_SCHEDULE = build_iteration_schedule(
     args.min_iterations,
     NUM_ITERATIONS,
     DEPTH,
-    args.compute_equivalent_layers,
+    COMPUTE_EQUIVALENT_LAYERS,
     COMPUTE_WIDTH_SCALE,
     WARMDOWN_RATIO,
 )
@@ -861,10 +886,12 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+                    momentum_t, lr_t, wd_t, beta2_t, active_mask, ns_steps, red_dim):
     momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    active = active_mask.to(stacked_grads.dtype)
+    momentum_update = (1 - momentum) * active
+    momentum_buffer.mul_(1 - momentum_update).add_(stacked_grads * momentum_update)
+    g = stacked_grads.lerp(momentum_buffer, momentum) * active
     # Polar Express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
@@ -883,7 +910,10 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    second_momentum_update = (1 - beta2) * active.to(second_momentum_buffer.dtype)
+    second_momentum_buffer.mul_(1 - second_momentum_update).add_(
+        v_mean.to(dtype=second_momentum_buffer.dtype) * second_momentum_update
+    )
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -893,7 +923,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+    stacked_params.sub_((lr * g + lr * wd * stacked_params * mask) * active)
 
 
 class DistMuonAdamW(torch.optim.Optimizer):
@@ -915,6 +945,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         infos = {}
         for p in group['params']:
             grad = p.grad
+            if grad is None:
+                continue
             if p.numel() < 1024:
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 infos[p] = dict(future=future, grad_slice=grad, is_small=True)
@@ -933,16 +965,29 @@ class DistMuonAdamW(torch.optim.Optimizer):
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
         stacked_grads = torch.empty(padded, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(torch.stack([p.grad for p in params]))
+        active_mask = torch.zeros(
+            (padded,) + (1,) * len(shape), dtype=torch.bool, device=device
+        )
+        for i, p in enumerate(params):
+            if p.grad is None:
+                stacked_grads[i].zero_()
+            else:
+                stacked_grads[i].copy_(p.grad)
+                active_mask[i].fill_(True)
         if len(params) < padded:
             stacked_grads[len(params):].zero_()
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+        return dict(
+            future=future,
+            grad_chunk=grad_chunk,
+            stacked_grads=stacked_grads,
+            active_mask=active_mask,
+            chunk_size=chunk_size,
+        )
 
     def _compute_adamw(self, group, info, gather_list, rank, world_size):
-        for p in group['params']:
-            pinfo = info['param_infos'][p]
+        for p, pinfo in info['param_infos'].items():
             pinfo['future'].wait()
             state = self.state[p]
             if pinfo['is_small']:
@@ -993,6 +1038,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             muon_step_fused(info['grad_chunk'][:num_owned], owned,
                           state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
                           self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                          info["active_mask"][start_idx:start_idx + num_owned],
                           group["ns_steps"], red_dim)
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
@@ -1249,7 +1295,8 @@ print0(
     f"avg_compute_equiv_layers={DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE:.3f}"
 )
 print0(
-    f"  compute_reference_n_embd={args.compute_reference_n_embd}, "
+    f"  compute_equivalent_layers={COMPUTE_EQUIVALENT_LAYERS}, "
+    f"compute_reference_n_embd={args.compute_reference_n_embd}, "
     f"compute_width_power={args.compute_width_power}, "
     f"compute_width_scale={COMPUTE_WIDTH_SCALE:.3f}"
 )
