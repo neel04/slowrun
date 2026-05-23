@@ -60,6 +60,43 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
+parser.add_argument(
+    "--num-iterations",
+    type=int,
+    default=3,
+    help="Maximum recurrent iterations through the network",
+)
+parser.add_argument(
+    "--iteration-schedule",
+    type=str,
+    default="constant",
+    choices=["constant", "compute-matched"],
+    help="Schedule recurrent iterations over training",
+)
+parser.add_argument(
+    "--min-iterations",
+    type=int,
+    default=1,
+    help="Initial recurrent iterations for --iteration-schedule compute-matched",
+)
+parser.add_argument(
+    "--compute-equivalent-layers",
+    type=float,
+    default=16.0,
+    help="Target average baseline-width-equivalent layer-passes per token",
+)
+parser.add_argument(
+    "--compute-reference-n-embd",
+    type=float,
+    default=1024.0,
+    help="Reference model width used by --compute-equivalent-layers",
+)
+parser.add_argument(
+    "--compute-width-power",
+    type=float,
+    default=2.0,
+    help="Width scaling exponent for compute matching; dense matmuls are ~2.0",
+)
 parser.add_argument("--n_head", type=int, default=8)
 parser.add_argument("--n_embd", type=int, default=1024)
 parser.add_argument("--lr_multiplier", type=float, default=0.8)
@@ -74,6 +111,14 @@ parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
 parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
+parser.add_argument(
+    "--hira-rank",
+    "--param-relax-rank",
+    dest="hira_rank",
+    type=int,
+    default=64,
+    help="Rank for per-iteration ABBA parameter relaxation adapters (0=disabled)",
+)
 args = parser.parse_args()
 
 # Resolve output path
@@ -84,11 +129,17 @@ if args.output_json and not args.save_result:
 # Hyperparameters
 # =============================================================================
 
+# RLM
+NUM_ITERATIONS = args.num_iterations
+
 # Architecture
 DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
+if args.compute_reference_n_embd <= 0:
+    raise ValueError("--compute-reference-n-embd must be > 0")
+COMPUTE_WIDTH_SCALE = (N_EMBD / args.compute_reference_n_embd) ** args.compute_width_power
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -115,6 +166,14 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
+FINAL_EXTRA_EVAL_ITERATIONS = 2
+TRAIN_BACKPROP_ITERATIONS = 1
+if NUM_ITERATIONS < 1:
+    raise ValueError("--num-iterations must be >= 1")
+if args.hira_rank < 0:
+    raise ValueError("--hira-rank must be >= 0")
+if TRAIN_BACKPROP_ITERATIONS < 1:
+    raise ValueError("TRAIN_BACKPROP_ITERATIONS must be >= 1")
 
 # =============================================================================
 # Utilities
@@ -128,6 +187,166 @@ def get_dist_info():
 def print0(s="", **kwargs):
     if int(os.environ.get('RANK', 0)) == 0:
         print(s, **kwargs)
+
+@dataclass(frozen=True)
+class IterationScheduleStage:
+    start_frac: float
+    end_frac: float
+    iterations: int
+
+
+@dataclass(frozen=True)
+class IterationSchedule:
+    stages: tuple
+    avg_iterations: float
+    target_effective_layers: float
+    width_compute_scale: float
+
+
+def build_iteration_schedule(
+    schedule_name,
+    min_iterations,
+    max_iterations,
+    n_layer,
+    target_effective_layers,
+    width_compute_scale,
+    warmdown_ratio,
+):
+    if max_iterations < 1:
+        raise ValueError("--num-iterations must be >= 1")
+    if min_iterations < 1:
+        raise ValueError("--min-iterations must be >= 1")
+    if min_iterations > max_iterations:
+        raise ValueError("--min-iterations must be <= --num-iterations")
+    if n_layer <= 0:
+        raise ValueError("--n_layer must be > 0")
+    if width_compute_scale <= 0:
+        raise ValueError("width_compute_scale must be > 0")
+
+    if schedule_name == "constant":
+        avg_iterations = float(max_iterations)
+        return IterationSchedule(
+            stages=(IterationScheduleStage(0.0, 1.0, max_iterations),),
+            avg_iterations=avg_iterations,
+            target_effective_layers=n_layer * avg_iterations * width_compute_scale,
+            width_compute_scale=width_compute_scale,
+        )
+
+    target_iterations = target_effective_layers / (n_layer * width_compute_scale)
+    if target_iterations < min_iterations or target_iterations > max_iterations:
+        raise ValueError(
+            "--compute-equivalent-layers requires an average of "
+            f"{target_iterations:.3f} iterations for n_layer={n_layer} "
+            f"and width_compute_scale={width_compute_scale:.3f}, outside "
+            f"[--min-iterations={min_iterations}, --num-iterations={max_iterations}]"
+        )
+
+    if min_iterations == max_iterations:
+        if abs(target_iterations - max_iterations) > 1e-9:
+            raise ValueError(
+                "Cannot compute-match with equal min/max iterations unless the "
+                "target equals that iteration count"
+            )
+        return IterationSchedule(
+            stages=(IterationScheduleStage(0.0, 1.0, max_iterations),),
+            avg_iterations=float(max_iterations),
+            target_effective_layers=target_effective_layers,
+            width_compute_scale=width_compute_scale,
+        )
+
+    warmdown_duration = min(max(warmdown_ratio, 0.0), 1.0)
+    extra_iterations = target_iterations - min_iterations
+    threshold_count = max_iterations - min_iterations
+    min_extra_with_max_before_warmdown = threshold_count * warmdown_duration
+    if extra_iterations < min_extra_with_max_before_warmdown - 1e-9:
+        warmdown_start_frac = 1.0 - warmdown_duration
+        raise ValueError(
+            "Compute-matched schedule cannot reach --num-iterations by warmdown "
+            f"start ({warmdown_start_frac:.3f}) without exceeding the compute "
+            f"target. Minimum average iterations would be "
+            f"{min_iterations + min_extra_with_max_before_warmdown:.3f}, "
+            f"but target is {target_iterations:.3f}."
+        )
+
+    suffix_durations = [warmdown_duration] * threshold_count
+    remaining_extra = extra_iterations - min_extra_with_max_before_warmdown
+    for i in range(threshold_count):
+        capacity = 1.0 - suffix_durations[i]
+        add = min(remaining_extra, capacity)
+        suffix_durations[i] += add
+        remaining_extra -= add
+        if remaining_extra <= 1e-9:
+            break
+    if remaining_extra > 1e-9:
+        raise ValueError(
+            "Could not build compute-matched iteration schedule; target average "
+            f"iterations {target_iterations:.3f} is too high"
+        )
+
+    durations = [1.0 - suffix_durations[0]]
+    for i in range(1, threshold_count):
+        durations.append(suffix_durations[i - 1] - suffix_durations[i])
+    durations.append(suffix_durations[-1])
+
+    stages = []
+    start_frac = 0.0
+    for offset, duration in enumerate(durations):
+        if duration <= 1e-9:
+            continue
+        end_frac = min(1.0, start_frac + duration)
+        stages.append(
+            IterationScheduleStage(start_frac, end_frac, min_iterations + offset)
+        )
+        start_frac = end_frac
+    if stages:
+        stages[-1] = IterationScheduleStage(
+            stages[-1].start_frac, 1.0, stages[-1].iterations
+        )
+    else:
+        stages = [IterationScheduleStage(0.0, 1.0, max_iterations)]
+    stages = tuple(stages)
+
+    avg_iterations = sum(
+        (stage.end_frac - stage.start_frac) * stage.iterations for stage in stages
+    )
+    return IterationSchedule(
+        stages=stages,
+        avg_iterations=avg_iterations,
+        target_effective_layers=target_effective_layers,
+        width_compute_scale=width_compute_scale,
+    )
+
+
+def get_scheduled_iterations(schedule, step, total_steps):
+    if total_steps <= 0:
+        return schedule.stages[-1].iterations
+    frac = min(max(step / total_steps, 0.0), 1.0)
+    for stage in schedule.stages:
+        if frac < stage.end_frac or stage is schedule.stages[-1]:
+            return stage.iterations
+    return schedule.stages[-1].iterations
+
+
+def format_iteration_schedule(schedule):
+    return ", ".join(
+        f"{stage.start_frac:.3f}-{stage.end_frac:.3f}: {stage.iterations}x"
+        for stage in schedule.stages
+    )
+
+
+def iteration_schedule_counts(schedule):
+    return tuple(dict.fromkeys(stage.iterations for stage in schedule.stages))
+
+
+ITERATION_SCHEDULE = build_iteration_schedule(
+    args.iteration_schedule,
+    args.min_iterations,
+    NUM_ITERATIONS,
+    DEPTH,
+    args.compute_equivalent_layers,
+    COMPUTE_WIDTH_SCALE,
+    WARMDOWN_RATIO,
+)
 
 class DummyWandb:
     def __init__(self): self.summary = {}
@@ -219,6 +438,8 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.1
     device_batch_size: int = 32
+    num_iterations: int = NUM_ITERATIONS
+    hira_rank: int = 8
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -231,6 +452,70 @@ def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], 3)
+
+
+def new_gelu(x):
+    c = math.sqrt(2.0 / math.pi)
+    return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * x.pow(3.0))))
+
+
+def megatron_uniform_(tensor):
+    fan_in, fan_out = tensor.shape
+    std = (0.33 / fan_in) ** 0.5
+    lim = fan_out**-0.5
+    return torch.nn.init.uniform_(tensor, -lim, lim).mul_(std)
+
+
+class ABBA(nn.Module):
+    """Per-iteration ABBA adapter for relaxing shared recurrent parameters."""
+
+    def __init__(self, in_dim, out_dim, rank):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.rank = rank
+        self.scale = 1.0 / rank
+        self.use_dense_weight = rank * rank * (in_dim + out_dim) >= in_dim * out_dim
+        self.B_1 = nn.Parameter(torch.empty(in_dim, rank))
+        self.A_1 = nn.Parameter(torch.empty(rank, out_dim))
+        self.B_2 = nn.Parameter(torch.empty(in_dim, rank))
+        self.A_2 = nn.Parameter(torch.empty(rank, out_dim))
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        megatron_uniform_(self.B_1)
+        megatron_uniform_(self.A_1)
+        torch.nn.init.zeros_(self.B_2)
+        megatron_uniform_(self.A_2)
+
+    def _forward_rank_squared(self, x):
+        a_kr = (
+            (self.A_1.mT.unsqueeze(-1) * self.A_2.mT.unsqueeze(-2))
+            .reshape(self.out_dim, self.rank * self.rank)
+            .transpose(0, 1)
+        ).to(dtype=x.dtype)
+        b_kr = (
+            (self.B_1.unsqueeze(-1) * self.B_2.unsqueeze(-2))
+            .reshape(self.B_1.size(0), self.rank * self.rank)
+            .to(dtype=x.dtype)
+        )
+        return (x @ b_kr) @ a_kr
+
+    def _forward_dense_weight(self, x):
+        weight = (self.B_1 @ self.A_1) * (self.B_2 @ self.A_2)
+        return x @ weight.to(dtype=x.dtype)
+
+    def forward(self, x):
+        if self.use_dense_weight:
+            out = self._forward_dense_weight(x)
+        else:
+            out = self._forward_rank_squared(x)
+        return self.scale * out
+
+    def compute_matmul_params(self):
+        if self.use_dense_weight:
+            return self.in_dim * self.out_dim
+        return self.rank * self.rank * (self.in_dim + self.out_dim)
 
 
 class CausalSelfAttention(nn.Module):
@@ -292,14 +577,37 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, enable_relax=True):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        if enable_relax and config.hira_rank > 0:
+            self.attn_relax = nn.ModuleList([
+                ABBA(config.n_embd, config.n_embd, config.hira_rank)
+                for _ in range(config.num_iterations)
+            ])
+            self.mlp_relax = nn.ModuleList([
+                ABBA(config.n_embd, config.n_embd, config.hira_rank)
+                for _ in range(config.num_iterations)
+            ])
+        else:
+            self.attn_relax = None
+            self.mlp_relax = None
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, ve, cos_sin, window_size, iteration_idx=None):
+        x_norm = norm(x)
+        attn_out = self.attn(x_norm, ve, cos_sin, window_size)
+        if self.attn_relax is not None and iteration_idx is not None:
+            relax_idx = min(iteration_idx, len(self.attn_relax) - 1)
+            attn_out = attn_out + new_gelu(self.attn_relax[relax_idx](x_norm))
+        x = x + attn_out
+
+        x_norm = norm(x)
+        mlp_out = self.mlp(x_norm)
+        if self.mlp_relax is not None and iteration_idx is not None:
+            relax_idx = min(iteration_idx, len(self.mlp_relax) - 1)
+            mlp_out = mlp_out + new_gelu(self.mlp_relax[relax_idx](x_norm))
+        x = x + mlp_out
         return x
 
 
@@ -351,6 +659,11 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
+            if block.attn_relax is not None:
+                for adapter in block.attn_relax:
+                    adapter.reset_parameters()
+                for adapter in block.mlp_relax:
+                    adapter.reset_parameters()
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
@@ -387,17 +700,56 @@ class GPT(nn.Module):
         max_keys = min(window + 1, seq_len)
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
-    def estimate_flops(self):
+    def estimate_flops(self, num_iterations=None):
+        active_num_iterations = (
+            self.config.num_iterations if num_iterations is None else num_iterations
+        )
+        if not 1 <= active_num_iterations <= self.config.num_iterations:
+            raise ValueError(
+                f"num_iterations must be in [1, {self.config.num_iterations}], "
+                f"got {active_num_iterations}"
+            )
         nparams = sum(p.numel() for p in self.parameters())
+        relax_modules = [
+            adapter
+            for block in self.transformer.h
+            for relax in (block.attn_relax, block.mlp_relax)
+            if relax is not None
+            for adapter in relax
+        ]
+        active_relax_modules = [
+            adapter
+            for block in self.transformer.h
+            for relax in (block.attn_relax, block.mlp_relax)
+            if relax is not None
+            for adapter in relax[:active_num_iterations]
+        ]
+        relax_params = sum(p.numel() for adapter in relax_modules for p in adapter.parameters())
+        relax_compute_params = sum(
+            adapter.compute_matmul_params() for adapter in active_relax_modules
+        )
+        shared_recurrent_params = (
+            sum(p.numel() for p in self.transformer.h.parameters())
+            - relax_params
+            + sum(p.numel() for p in self.ve_projs.parameters())
+        )
         # Exclude non-matmul params: embedding lookup + elementwise scalars
         nparams_exclude = (self.transformer.wte.weight.numel()
                           + self.resid_lambdas.numel()
                           + self.x0_lambdas.numel()
                           + self.skip_weights.numel())
+        extra_nonshared_params = (
+            nparams - nparams_exclude - shared_recurrent_params - relax_params
+        )
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
-        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        attn_flops = active_num_iterations * sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
+        effective_params = (
+            extra_nonshared_params
+            + active_num_iterations * shared_recurrent_params
+            + relax_compute_params
+        )
+        return 6 * effective_params + attn_flops
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -430,10 +782,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
-        B, T = idx.size()
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
-        x = norm(self.transformer.wte(idx))
+    def _run_network_once(self, x, cos_sin, iteration_idx):
         x0 = x
         skip_connections = []
         for i, block in enumerate(self.transformer.h):
@@ -442,9 +791,45 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * skip
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            x = block(x, ve, cos_sin, self.window_sizes[i], iteration_idx)
             if i < self.encoder_layers:
                 skip_connections.append(x)
+        return x
+
+    def forward(
+        self,
+        idx,
+        targets=None,
+        loss_reduction='mean',
+        num_iterations=None,
+        allow_extra_iterations=False,
+    ):
+        B, T = idx.size()
+        active_num_iterations = (
+            self.config.num_iterations if num_iterations is None else num_iterations
+        )
+        max_num_iterations = self.config.num_iterations
+        if allow_extra_iterations and not self.training:
+            max_num_iterations += FINAL_EXTRA_EVAL_ITERATIONS
+        if not 1 <= active_num_iterations <= max_num_iterations:
+            raise ValueError(
+                f"num_iterations must be in [1, {max_num_iterations}], "
+                f"got {active_num_iterations}"
+            )
+
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        x = norm(self.transformer.wte(idx))
+        grad_start_iteration = 0
+        if self.training:
+            backprop_iterations = min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations)
+            grad_start_iteration = active_num_iterations - backprop_iterations
+        for iteration in range(active_num_iterations):
+            if self.training and iteration < grad_start_iteration:
+                with torch.no_grad():
+                    x = self._run_network_once(x, cos_sin, iteration)
+                x = x.detach()
+            else:
+                x = self._run_network_once(x, cos_sin, iteration)
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
@@ -715,16 +1100,26 @@ class DataLoader:
 # =============================================================================
 
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes):
+def evaluate_bpb(
+    model,
+    batches,
+    steps,
+    token_bytes,
+    num_iterations=None,
+    allow_extra_iterations=False,
+):
     """Compute bits per byte and mean cross-entropy loss on a set of batches."""
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
+    model_kwargs = {"num_iterations": num_iterations}
+    if allow_extra_iterations:
+        model_kwargs["allow_extra_iterations"] = True
     for _ in range(steps):
         x, y, _ = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none').view(-1)
+        loss2d = model(x, y, loss_reduction='none', **model_kwargs).view(-1)
         y = y.view(-1)
         mask = y != -1
         total_loss += loss2d[mask].sum()
@@ -742,6 +1137,28 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
     loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
     return bpb, loss
+
+
+def precompile_iteration_stages(model, x, y, iteration_counts):
+    if len(iteration_counts) <= 1:
+        return
+    print0(f"Precompiling recurrent iteration stages: {iteration_counts}")
+    was_training = model.training
+    for count in iteration_counts:
+        model.train()
+        model.zero_grad(set_to_none=True)
+        with autocast_ctx:
+            loss = model(x, y, num_iterations=count)
+        loss.backward()
+        model.zero_grad(set_to_none=True)
+
+        model.eval()
+        with torch.no_grad():
+            with autocast_ctx:
+                model(x, y, loss_reduction='none', num_iterations=count)
+        synchronize()
+    model.train(was_training)
+    model.zero_grad(set_to_none=True)
 
 # =============================================================================
 # Training
@@ -823,6 +1240,19 @@ print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
+print0(f"  max_num_iterations={NUM_ITERATIONS}, hira_rank={args.hira_rank}")
+print0(f"  train_backprop_iterations={TRAIN_BACKPROP_ITERATIONS}")
+print0(
+    f"  iteration_schedule={args.iteration_schedule} "
+    f"({format_iteration_schedule(ITERATION_SCHEDULE)}), "
+    f"avg_layer_passes={DEPTH * ITERATION_SCHEDULE.avg_iterations:.3f}, "
+    f"avg_compute_equiv_layers={DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE:.3f}"
+)
+print0(
+    f"  compute_reference_n_embd={args.compute_reference_n_embd}, "
+    f"compute_width_power={args.compute_width_power}, "
+    f"compute_width_scale={COMPUTE_WIDTH_SCALE:.3f}"
+)
 print0(f"  dropout={args.dropout}")
 print0(f"  doc_shuffle={not args.no_doc_shuffle}")
 print0(f"  run={run_name}")
@@ -844,20 +1274,37 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size)
+config = GPTConfig(
+    vocab_size=vocab_size,
+    dropout=args.dropout,
+    device_batch_size=args.device_batch_size,
+    num_iterations=NUM_ITERATIONS,
+    hira_rank=args.hira_rank,
+)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+print0(f"HiRA parameter relaxation: {'enabled' if args.hira_rank > 0 else 'disabled'}")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
 ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
 other_params = param_counts - transformer_params - ve_params - lm_head_params
-num_flops_per_token = model.estimate_flops()
+max_flops_per_token = model.estimate_flops(NUM_ITERATIONS)
+scheduled_iteration_counts = iteration_schedule_counts(ITERATION_SCHEDULE)
+schedule_flops_per_token = {
+    iteration_count: model.estimate_flops(iteration_count)
+    for iteration_count in scheduled_iteration_counts
+}
+avg_flops_per_token = sum(
+    (stage.end_frac - stage.start_frac) * schedule_flops_per_token[stage.iterations]
+    for stage in ITERATION_SCHEDULE.stages
+)
 print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
-print0(f"FLOPs per token: {num_flops_per_token:e}")
+print0(f"FLOPs per token at max iterations: {max_flops_per_token:e}")
+print0(f"Average scheduled FLOPs per token: {avg_flops_per_token:e}")
 
 # Compile
 orig_model = model
@@ -878,22 +1325,29 @@ x, y, current_epoch = next(train_loader)
 tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
-# Convert epoch boundaries to steps (must happen after num_iterations is known)
-wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_iterations)
-wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_iterations)
+num_train_steps = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
+# Convert epoch boundaries to steps (must happen after num_train_steps is known)
+wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_train_steps)
+wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_train_steps)
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
-print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
+print0(f"Training for {args.num_epochs} epoch(s) (~{num_train_steps} steps estimated)")
+print0(f"Recurrent iteration schedule: {format_iteration_schedule(ITERATION_SCHEDULE)}")
+for stage in ITERATION_SCHEDULE.stages:
+    print0(
+        f"  {stage.start_frac:.3f}-{stage.end_frac:.3f} "
+        f"(~steps {round(stage.start_frac * num_train_steps)}-"
+        f"{round(stage.end_frac * num_train_steps)}): {stage.iterations} iteration(s)"
+    )
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
 # Schedulers
 def get_lr_multiplier(it):
-    warmup = round(WARMUP_RATIO * num_iterations)
-    warmdown = round(WARMDOWN_RATIO * num_iterations)
+    warmup = round(WARMUP_RATIO * num_train_steps)
+    warmdown = round(WARMDOWN_RATIO * num_train_steps)
     if it < warmup: return (it + 1) / warmup
-    elif it <= num_iterations - warmdown: return 1.0
+    elif it <= num_train_steps - warmdown: return 1.0
     else:
-        progress = (num_iterations - it) / warmdown
+        progress = (num_train_steps - it) / warmdown
         return progress + (1 - progress) * FINAL_LR_FRAC
 
 def get_muon_momentum(it):
@@ -907,32 +1361,54 @@ epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
-steps_per_epoch = num_iterations / args.num_epochs
+steps_per_epoch = num_train_steps / args.num_epochs
 param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
 ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
 
 wall_clock_start = time.time()
-_swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
+_swa_start_step = (num_train_steps - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
 late_ckpt_paths = []
+active_num_iterations = get_scheduled_iterations(
+    ITERATION_SCHEDULE, step, num_train_steps
+)
+precompile_iteration_stages(model, x, y, scheduled_iteration_counts)
 
 # Initial val evaluation
 model.eval()
 val_loader = build_val_loader()
 with autocast_ctx:
-    val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+    val_bpb, val_loss = evaluate_bpb(
+        model, val_loader, eval_steps, token_bytes, num_iterations=active_num_iterations
+    )
+print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} | iters: {active_num_iterations}")
+wandb_run.log({
+    "step": step,
+    "val/bpb": val_bpb,
+    "val/loss": val_loss,
+    "val/num_iterations": active_num_iterations,
+})
 min_val_bpb = val_bpb
 min_val_loss = val_loss
 model.train()
 
 while current_epoch <= args.num_epochs:
+    next_num_iterations = get_scheduled_iterations(
+        ITERATION_SCHEDULE, step, num_train_steps
+    )
+    if next_num_iterations != active_num_iterations:
+        active_num_iterations = next_num_iterations
+        print0(
+            f"\n=== Recurrent iterations -> {active_num_iterations} "
+            f"at step {step} ({100 * step / num_train_steps:.2f}%, "
+            f"epoch {current_epoch}) ==="
+        )
+
     # Training step
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x, y, num_iterations=active_num_iterations)
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
@@ -947,9 +1423,9 @@ while current_epoch <= args.num_epochs:
     # WD schedule:
     #   [0, wd_phase1_end_step]:              hold at weight_decay
     #   [wd_phase1_end_step, wd_phase2_end_step]: decay to wd_mid
-    #   [wd_phase2_end_step, num_iterations]:     ramp up to wd_end
+    #   [wd_phase2_end_step, num_train_steps]:    ramp up to wd_end
     wd = np.interp(step,
-        [0, wd_phase1_end_step, wd_phase2_end_step, num_iterations],
+        [0, wd_phase1_end_step, wd_phase2_end_step, num_train_steps],
         [args.weight_decay, args.weight_decay, args.wd_mid, args.wd_end])
     # Convert to a scale factor;
     # groups with weight_decay=0.0 (scalar params) correctly stay at zero.
@@ -975,15 +1451,25 @@ while current_epoch <= args.num_epochs:
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased = smooth_train_loss / (1 - ema_beta**step)
-    pct = 100 * step / num_iterations
+    pct = 100 * step / num_train_steps
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
+    active_flops_per_token = schedule_flops_per_token[active_num_iterations]
+    mfu = 100 * active_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
     if step > 3:
         total_training_time += dt
     steps_done = step - 3
-    eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    eta_str = f" | eta: {(num_train_steps - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
+    train_backprop_iterations = min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations)
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}% | iters: {active_num_iterations}{eta_str}")
+    wandb_run.log({
+        "step": step,
+        "train/loss": debiased,
+        "train/mfu": mfu,
+        "train/num_iterations": active_num_iterations,
+        "train/backprop_iterations": train_backprop_iterations,
+        "train/effective_layers": DEPTH * active_num_iterations,
+        "train/backprop_layers": DEPTH * train_backprop_iterations,
+    })
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -996,9 +1482,17 @@ while current_epoch <= args.num_epochs:
         model.eval()
         val_loader = build_val_loader()
         with autocast_ctx:
-            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+            val_bpb, val_loss = evaluate_bpb(
+                model, val_loader, eval_steps, token_bytes, num_iterations=active_num_iterations
+            )
+        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} | iters: {active_num_iterations}")
+        wandb_run.log({
+            "step": step,
+            "epoch": current_epoch,
+            "val/bpb": val_bpb,
+            "val/loss": val_loss,
+            "val/num_iterations": active_num_iterations,
+        })
         # Save checkpoint for weight averaging
         ckpt_path = os.path.join(checkpoints_dir, f"epoch_{current_epoch:03d}.pt")
         if master_process:
@@ -1036,9 +1530,16 @@ if ema_params is not None:
                 p.copy_(ema * correction)
         val_loader = build_val_loader()
         with autocast_ctx:
-            ema_bpb, ema_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f}")
-        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss})
+            ema_bpb, ema_loss = evaluate_bpb(
+                model, val_loader, eval_steps, token_bytes, num_iterations=NUM_ITERATIONS
+            )
+        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f} | iters: {NUM_ITERATIONS}")
+        wandb_run.log({
+            "step": step,
+            "val/ema_bpb": ema_bpb,
+            "val/ema_loss": ema_loss,
+            "val/num_iterations": NUM_ITERATIONS,
+        })
         val_bpb = ema_bpb
         val_loss = ema_loss
         if ema_bpb < min_val_bpb:
@@ -1063,11 +1564,64 @@ if len(late_ckpt_paths) >= 2:
     model.eval()
     val_loader = build_val_loader()
     with autocast_ctx:
-        avg_bpb, avg_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
-    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss})
+        avg_bpb, avg_loss = evaluate_bpb(
+            model, val_loader, eval_steps, token_bytes, num_iterations=NUM_ITERATIONS
+        )
+    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f} | iters: {NUM_ITERATIONS}")
+    wandb_run.log({
+        "ckpt_avg/bpb": avg_bpb,
+        "ckpt_avg/loss": avg_loss,
+        "ckpt_avg/num_iterations": NUM_ITERATIONS,
+    })
     if avg_loss < min_val_loss:
         min_val_loss, min_val_bpb = avg_loss, avg_bpb
+
+final_iteration_eval_results = []
+
+
+def run_final_iteration_eval(label, eval_num_iterations, allow_extra_iterations=False):
+    model.eval()
+    val_loader = build_val_loader()
+    with autocast_ctx:
+        bpb, loss = evaluate_bpb(
+            model,
+            val_loader,
+            eval_steps,
+            token_bytes,
+            num_iterations=eval_num_iterations,
+            allow_extra_iterations=allow_extra_iterations,
+        )
+    print0(
+        f"Final {label} Val BPB: {bpb:.6f} | Val Loss: {loss:.6f} "
+        f"| iters: {eval_num_iterations}"
+    )
+    wandb_run.log({
+        f"final_iteration_eval/{label}_bpb": bpb,
+        f"final_iteration_eval/{label}_loss": loss,
+        f"final_iteration_eval/{label}_num_iterations": eval_num_iterations,
+    })
+    result = {
+        "label": label,
+        "num_iterations": eval_num_iterations,
+        "base_num_iterations": NUM_ITERATIONS,
+        "bpb": bpb,
+        "loss": loss,
+    }
+    if allow_extra_iterations:
+        result["extra_iterations"] = eval_num_iterations - NUM_ITERATIONS
+    final_iteration_eval_results.append(result)
+    return bpb, loss
+
+
+if NUM_ITERATIONS > 1:
+    run_final_iteration_eval(f"{NUM_ITERATIONS - 1}iter", NUM_ITERATIONS - 1)
+run_final_iteration_eval(f"{NUM_ITERATIONS}iter", NUM_ITERATIONS)
+extra_eval_num_iterations = NUM_ITERATIONS + FINAL_EXTRA_EVAL_ITERATIONS
+run_final_iteration_eval(
+    f"{extra_eval_num_iterations}iter_extra",
+    extra_eval_num_iterations,
+    allow_extra_iterations=True,
+)
 
 # Summary
 wall_clock_time = time.time() - wall_clock_start
@@ -1080,16 +1634,45 @@ print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
+for eval_result in final_iteration_eval_results:
+    summary_prefix = f"final_iteration_eval/{eval_result['label']}"
+    wandb_run.summary[f"{summary_prefix}_bpb"] = eval_result["bpb"]
+    wandb_run.summary[f"{summary_prefix}_loss"] = eval_result["loss"]
+    wandb_run.summary[f"{summary_prefix}_num_iterations"] = eval_result[
+        "num_iterations"
+    ]
 
 if master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "max_num_iterations": NUM_ITERATIONS,
+        "train_backprop_iterations": TRAIN_BACKPROP_ITERATIONS,
+        "iteration_schedule": args.iteration_schedule,
+        "iteration_schedule_stages": [
+            {
+                "start_frac": stage.start_frac,
+                "end_frac": stage.end_frac,
+                "iterations": stage.iterations,
+            }
+            for stage in ITERATION_SCHEDULE.stages
+        ],
+        "avg_effective_layers": DEPTH * ITERATION_SCHEDULE.avg_iterations,
+        "avg_effective_layer_passes": DEPTH * ITERATION_SCHEDULE.avg_iterations,
+        "avg_compute_equivalent_layers": (
+            DEPTH * ITERATION_SCHEDULE.avg_iterations * COMPUTE_WIDTH_SCALE
+        ),
+        "compute_reference_n_embd": args.compute_reference_n_embd,
+        "compute_width_power": args.compute_width_power,
+        "compute_width_scale": COMPUTE_WIDTH_SCALE,
+        "hira_rank": args.hira_rank,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
     }
+    if final_iteration_eval_results:
+        result["final_iteration_evals"] = final_iteration_eval_results
     with open(result_path, "w") as f:
         json.dump(result, f, indent=2)
     print0(f"Result saved to {result_path}")
