@@ -47,15 +47,15 @@ parser.add_argument("--scalar-lr", type=float, default=0.25)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
 parser.add_argument("--unembedding-lr", type=float, default=0.001)
-parser.add_argument("--weight-decay", type=float, default=0.8)
+parser.add_argument("--weight-decay", type=float, default=0.2)
 # WD follows a 3-phase schedule: hold → decay → ramp
 #   [0, wd-phase1-epoch]:          hold at --weight-decay
 #   [wd-phase1-epoch, wd-phase2-epoch]: decay to --wd-mid
 #   [wd-phase2-epoch, num-epochs]:      ramp up to --wd-end
 parser.add_argument("--wd-phase1-epoch", type=int, default=2)
 parser.add_argument("--wd-phase2-epoch", type=int, default=8)
-parser.add_argument("--wd-mid", type=float, default=0.1)
-parser.add_argument("--wd-end", type=float, default=1.25)
+parser.add_argument("--wd-mid", type=float, default=0.02)
+parser.add_argument("--wd-end", type=float, default=0.3)
 parser.add_argument("--warmdown-ratio", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
@@ -125,7 +125,7 @@ parser.add_argument(
     "--param-relax-rank",
     dest="hira_rank",
     type=int,
-    default=64,
+    default=128,
     help="Rank for per-iteration ABBA parameter relaxation adapters (0=disabled)",
 )
 args = parser.parse_args()
@@ -157,11 +157,21 @@ if COMPUTE_EQUIVALENT_LAYERS <= 0:
     raise ValueError("--compute-equivalent-layers must be > 0")
 if args.n_layer is None:
     if args.iteration_schedule == "compute-matched":
+        warmdown_duration = min(max(args.warmdown_ratio, 0.0), 1.0)
+        min_schedule_avg_iterations = (
+            args.min_iterations
+            + (NUM_ITERATIONS - args.min_iterations) * warmdown_duration
+        )
+        max_compute_matched_depth = math.floor(
+            COMPUTE_EQUIVALENT_LAYERS
+            / (min_schedule_avg_iterations * COMPUTE_WIDTH_SCALE)
+        )
+        min_compute_matched_depth = math.ceil(
+            COMPUTE_EQUIVALENT_LAYERS / (NUM_ITERATIONS * COMPUTE_WIDTH_SCALE)
+        )
         DEPTH = max(
-            1,
-            math.ceil(
-                COMPUTE_EQUIVALENT_LAYERS / (NUM_ITERATIONS * COMPUTE_WIDTH_SCALE)
-            ),
+            min_compute_matched_depth,
+            max_compute_matched_depth,
         )
     else:
         DEPTH = TINY_BASELINE_LAYERS
@@ -193,7 +203,6 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
-FINAL_EXTRA_EVAL_ITERATIONS = 2
 TRAIN_BACKPROP_ITERATIONS = 1
 if args.hira_rank < 0:
     raise ValueError("--hira-rank must be >= 0")
@@ -413,8 +422,12 @@ def _load_fa3():
             return None
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel
-        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
-    except Exception:
+        return get_kernel("kernels-community/flash-attn3", version=1)
+    except ImportError:
+        print0("Warning: kernels package not found. Install with: pip install -U kernels")
+        return None
+    except Exception as e:
+        print0(f"Warning: Failed to load FA3 kernel: {e}")
         return None
 
 _fa3 = _load_fa3()
@@ -827,18 +840,14 @@ class GPT(nn.Module):
         targets=None,
         loss_reduction='mean',
         num_iterations=None,
-        allow_extra_iterations=False,
     ):
         B, T = idx.size()
         active_num_iterations = (
             self.config.num_iterations if num_iterations is None else num_iterations
         )
-        max_num_iterations = self.config.num_iterations
-        if allow_extra_iterations and not self.training:
-            max_num_iterations += FINAL_EXTRA_EVAL_ITERATIONS
-        if not 1 <= active_num_iterations <= max_num_iterations:
+        if not 1 <= active_num_iterations <= self.config.num_iterations:
             raise ValueError(
-                f"num_iterations must be in [1, {max_num_iterations}], "
+                f"num_iterations must be in [1, {self.config.num_iterations}], "
                 f"got {active_num_iterations}"
             )
 
@@ -1152,7 +1161,6 @@ def evaluate_bpb(
     steps,
     token_bytes,
     num_iterations=None,
-    allow_extra_iterations=False,
 ):
     """Compute bits per byte and mean cross-entropy loss on a set of batches."""
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
@@ -1161,8 +1169,6 @@ def evaluate_bpb(
     total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     model_kwargs = {"num_iterations": num_iterations}
-    if allow_extra_iterations:
-        model_kwargs["allow_extra_iterations"] = True
     for _ in range(steps):
         x, y, _ = next(batch_iter)
         loss2d = model(x, y, loss_reduction='none', **model_kwargs).view(-1)
@@ -1186,7 +1192,7 @@ def evaluate_bpb(
 
 
 def precompile_iteration_stages(model, x, y, iteration_counts):
-    if len(iteration_counts) <= 1:
+    if not iteration_counts:
         return
     print0(f"Precompiling recurrent iteration stages: {iteration_counts}")
     was_training = model.training
@@ -1284,6 +1290,7 @@ print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
+print0(f"  wd_schedule=hold {args.weight_decay} -> mid {args.wd_mid} -> end {args.wd_end}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  max_num_iterations={NUM_ITERATIONS}, hira_rank={args.hira_rank}")
@@ -1418,7 +1425,7 @@ late_ckpt_paths = []
 active_num_iterations = get_scheduled_iterations(
     ITERATION_SCHEDULE, step, num_train_steps
 )
-precompile_iteration_stages(model, x, y, scheduled_iteration_counts)
+precompile_iteration_stages(model, x, y, (active_num_iterations,))
 
 # Initial val evaluation
 model.eval()
@@ -1623,53 +1630,6 @@ if len(late_ckpt_paths) >= 2:
     if avg_loss < min_val_loss:
         min_val_loss, min_val_bpb = avg_loss, avg_bpb
 
-final_iteration_eval_results = []
-
-
-def run_final_iteration_eval(label, eval_num_iterations, allow_extra_iterations=False):
-    model.eval()
-    val_loader = build_val_loader()
-    with autocast_ctx:
-        bpb, loss = evaluate_bpb(
-            model,
-            val_loader,
-            eval_steps,
-            token_bytes,
-            num_iterations=eval_num_iterations,
-            allow_extra_iterations=allow_extra_iterations,
-        )
-    print0(
-        f"Final {label} Val BPB: {bpb:.6f} | Val Loss: {loss:.6f} "
-        f"| iters: {eval_num_iterations}"
-    )
-    wandb_run.log({
-        f"final_iteration_eval/{label}_bpb": bpb,
-        f"final_iteration_eval/{label}_loss": loss,
-        f"final_iteration_eval/{label}_num_iterations": eval_num_iterations,
-    })
-    result = {
-        "label": label,
-        "num_iterations": eval_num_iterations,
-        "base_num_iterations": NUM_ITERATIONS,
-        "bpb": bpb,
-        "loss": loss,
-    }
-    if allow_extra_iterations:
-        result["extra_iterations"] = eval_num_iterations - NUM_ITERATIONS
-    final_iteration_eval_results.append(result)
-    return bpb, loss
-
-
-if NUM_ITERATIONS > 1:
-    run_final_iteration_eval(f"{NUM_ITERATIONS - 1}iter", NUM_ITERATIONS - 1)
-run_final_iteration_eval(f"{NUM_ITERATIONS}iter", NUM_ITERATIONS)
-extra_eval_num_iterations = NUM_ITERATIONS + FINAL_EXTRA_EVAL_ITERATIONS
-run_final_iteration_eval(
-    f"{extra_eval_num_iterations}iter_extra",
-    extra_eval_num_iterations,
-    allow_extra_iterations=True,
-)
-
 # Summary
 wall_clock_time = time.time() - wall_clock_start
 print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
@@ -1681,13 +1641,6 @@ print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
-for eval_result in final_iteration_eval_results:
-    summary_prefix = f"final_iteration_eval/{eval_result['label']}"
-    wandb_run.summary[f"{summary_prefix}_bpb"] = eval_result["bpb"]
-    wandb_run.summary[f"{summary_prefix}_loss"] = eval_result["loss"]
-    wandb_run.summary[f"{summary_prefix}_num_iterations"] = eval_result[
-        "num_iterations"
-    ]
 
 if master_process:
     result = {
@@ -1718,8 +1671,6 @@ if master_process:
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
     }
-    if final_iteration_eval_results:
-        result["final_iteration_evals"] = final_iteration_eval_results
     with open(result_path, "w") as f:
         json.dump(result, f, indent=2)
     print0(f"Result saved to {result_path}")

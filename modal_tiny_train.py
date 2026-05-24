@@ -53,7 +53,7 @@ app = modal.App(APP_NAME)
 
 @app.function(
     image=image,
-    gpu="H100:8",
+    gpu="H100!:8",
     timeout=2 * 60 * 60,
     secrets=secrets,
 )
@@ -79,4 +79,6 @@ def run_tiny_train(train_args: str = "") -> int:
 
 @app.local_entrypoint()
 def main(train_args: str = ""):
-    run_tiny_train.remote(train_args)
+    call = run_tiny_train.spawn(train_args)
+    print(f"Spawned Modal function call: {call.object_id}")
+    print(f"Dashboard: {call.get_dashboard_url()}")

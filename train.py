@@ -265,7 +265,6 @@ WD_PRE_HOLD_FRAC = 0.40   # hold at base WD for first 40% of training, then deca
 WD_SWA_LOW_FACTOR = 0.65  # WD at start of each SWA epoch (LR is high → less regularization)
 WD_SWA_HIGH_FACTOR = 1.50 # WD at end of each SWA epoch (LR has decayed → more regularization)
 LOGIT_CAP = args.logit_cap
-FINAL_EXTRA_EVAL_ITERATIONS = 2
 # TRM-style truncated recurrence: keep the requested number of forward passes,
 # but retain autograd only for the final N recurrent iterations during training.
 TRAIN_BACKPROP_ITERATIONS = 1
@@ -1170,17 +1169,13 @@ class GPT(nn.Module):
         targets=None,
         loss_reduction="mean",
         num_iterations=None,
-        allow_extra_iterations=False,
     ):
         active_num_iterations = (
             self.config.num_iterations if num_iterations is None else num_iterations
         )
-        max_num_iterations = self.config.num_iterations
-        if allow_extra_iterations and not self.training:
-            max_num_iterations += FINAL_EXTRA_EVAL_ITERATIONS
-        if not 1 <= active_num_iterations <= max_num_iterations:
+        if not 1 <= active_num_iterations <= self.config.num_iterations:
             raise ValueError(
-                f"num_iterations must be in [1, {max_num_iterations}], "
+                f"num_iterations must be in [1, {self.config.num_iterations}], "
                 f"got {active_num_iterations}"
             )
         _, T = idx.size()
@@ -1657,7 +1652,6 @@ def evaluate_bpb(
     steps,
     token_bytes,
     num_iterations=None,
-    allow_extra_iterations=False,
 ):
     """Compute bits per byte and mean cross-entropy loss on a set of batches."""
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
@@ -1666,8 +1660,6 @@ def evaluate_bpb(
     total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     model_kwargs = {"num_iterations": num_iterations}
-    if allow_extra_iterations:
-        model_kwargs["allow_extra_iterations"] = True
     for _ in range(steps):
         x, y, _ = next(batch_iter)
         loss2d = model(
@@ -1702,7 +1694,6 @@ def evaluate_bpb_logit_avg(
     weights,
     steps,
     num_iterations=None,
-    allow_extra_iterations=False,
 ):
     """Evaluate using probability averaging across checkpoints (proper ensemble).
 
@@ -1729,8 +1720,6 @@ def evaluate_bpb_logit_avg(
 
     # Checkpoint-outer, batch-inner: each checkpoint loaded exactly once
     model_kwargs = {"num_iterations": num_iterations}
-    if allow_extra_iterations:
-        model_kwargs["allow_extra_iterations"] = True
     for path, w in zip(ckpt_paths, weights):
         ckpt = torch.load(path, map_location="cpu", weights_only=True)
         load_state_dict_into_model(orig_model, ckpt)
@@ -2356,9 +2345,6 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
 # Post-training: evaluate checkpoint averages
 # =============================================================================
 
-final_extra_iter_result = None
-final_iteration_eval_results = []
-
 # Evaluate logit (probability) average
 if logit_avg_count > 0:
     # In eval-only mode, discover checkpoints from disk; otherwise use what was saved during training
@@ -2382,9 +2368,7 @@ if logit_avg_count > 0:
         la_model = torch.compile(orig_model, dynamic=False)
         la_model.eval()
 
-        def _run_mode(
-            label, weights, eval_num_iterations, allow_extra_iterations=False
-        ):
+        def _run_mode(label, weights, eval_num_iterations):
             print0(f"  [{label}] weights: {[f'{w:.3f}' for w in weights]}")
             bpb, loss = evaluate_bpb_logit_avg(
                 la_model,
@@ -2392,7 +2376,6 @@ if logit_avg_count > 0:
                 weights,
                 eval_steps,
                 num_iterations=eval_num_iterations,
-                allow_extra_iterations=allow_extra_iterations,
             )
             print0(
                 f"  [{label}] Val BPB: {bpb:.6f} | Val Loss: {loss:.6f} "
@@ -2408,19 +2391,9 @@ if logit_avg_count > 0:
         equal_w = [1.0 / n] * n
         raw_w = list(range(1, n + 1))
         weighted_w = [w / sum(raw_w) for w in raw_w]
-        best_logit_avg = {
-            "label": None,
-            "weights": None,
-            "bpb": float("inf"),
-            "loss": float("inf"),
-        }
 
         if args.logit_avg_mode in ("equal", "both"):
             eq_bpb, eq_loss = _run_mode("equal", equal_w, logit_avg_num_iterations)
-            if eq_loss < best_logit_avg["loss"]:
-                best_logit_avg.update(
-                    label="equal", weights=list(equal_w), bpb=eq_bpb, loss=eq_loss
-                )
             if eq_loss < min_val_loss:
                 min_val_loss, min_val_bpb = eq_loss, eq_bpb
                 print0("  ** New best! (logit avg equal weights)")
@@ -2429,83 +2402,9 @@ if logit_avg_count > 0:
             wt_bpb, wt_loss = _run_mode(
                 "weighted", weighted_w, logit_avg_num_iterations
             )
-            if wt_loss < best_logit_avg["loss"]:
-                best_logit_avg.update(
-                    label="weighted",
-                    weights=list(weighted_w),
-                    bpb=wt_bpb,
-                    loss=wt_loss,
-                )
             if wt_loss < min_val_loss:
                 min_val_loss, min_val_bpb = wt_loss, wt_bpb
                 print0("  ** New best! (logit avg recency weights)")
-
-        if best_logit_avg["weights"] is not None:
-            best_source = f"logit_avg_{best_logit_avg['label']}"
-            minus_one_logit_avg_num_iterations = max(
-                1, logit_avg_num_iterations - 1
-            )
-            if minus_one_logit_avg_num_iterations != logit_avg_num_iterations:
-                minus_one_label = f"{best_logit_avg['label']}_minus_1_iter"
-                print0(
-                    f"\n--- Re-evaluating best logit avg "
-                    f"({best_logit_avg['label']}, loss={best_logit_avg['loss']:.6f}) "
-                    f"at {minus_one_logit_avg_num_iterations} recurrent iterations "
-                    "(-1) ---"
-                )
-                minus_one_bpb, minus_one_loss = _run_mode(
-                    minus_one_label,
-                    best_logit_avg["weights"],
-                    minus_one_logit_avg_num_iterations,
-                )
-                final_iteration_eval_results.append({
-                    "label": "n_minus_1",
-                    "source": best_source,
-                    "base_num_iterations": logit_avg_num_iterations,
-                    "num_iterations": minus_one_logit_avg_num_iterations,
-                    "bpb": minus_one_bpb,
-                    "loss": minus_one_loss,
-                })
-
-            final_iteration_eval_results.append({
-                "label": "n",
-                "source": best_source,
-                "base_num_iterations": logit_avg_num_iterations,
-                "num_iterations": logit_avg_num_iterations,
-                "bpb": best_logit_avg["bpb"],
-                "loss": best_logit_avg["loss"],
-            })
-
-            extra_logit_avg_num_iterations = (
-                logit_avg_num_iterations + FINAL_EXTRA_EVAL_ITERATIONS
-            )
-            extra_label = (
-                f"{best_logit_avg['label']}_plus_{FINAL_EXTRA_EVAL_ITERATIONS}_iter"
-            )
-            print0(
-                f"\n--- Re-evaluating best logit avg "
-                f"({best_logit_avg['label']}, loss={best_logit_avg['loss']:.6f}) "
-                f"at {extra_logit_avg_num_iterations} recurrent iterations "
-                f"(+{FINAL_EXTRA_EVAL_ITERATIONS}); "
-                "extra passes reuse the final trained HiRA adapter ---"
-            )
-            extra_bpb, extra_loss = _run_mode(
-                extra_label,
-                best_logit_avg["weights"],
-                extra_logit_avg_num_iterations,
-                allow_extra_iterations=True,
-            )
-            final_extra_iter_result = {
-                "label": f"n_plus_{FINAL_EXTRA_EVAL_ITERATIONS}",
-                "source": best_source,
-                "base_num_iterations": logit_avg_num_iterations,
-                "extra_iterations": FINAL_EXTRA_EVAL_ITERATIONS,
-                "num_iterations": extra_logit_avg_num_iterations,
-                "bpb": extra_bpb,
-                "loss": extra_loss,
-            }
-            final_iteration_eval_results.append(final_extra_iter_result)
-
 
 # Summary
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
@@ -2514,28 +2413,9 @@ final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float("i
 print0(f"Final train loss: {final_train_loss:.6f}")
 print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
-if final_iteration_eval_results:
-    print0("Final logit-avg iteration evals:")
-    for eval_result in final_iteration_eval_results:
-        print0(
-            f"  {eval_result['label']} "
-            f"({eval_result['source']}, {eval_result['num_iterations']} iters) "
-            f"BPB: {eval_result['bpb']:.6f} | "
-            f"Loss: {eval_result['loss']:.6f}"
-        )
 
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
-if final_extra_iter_result is not None:
-    wandb_run.summary["final_extra_iter_eval_loss"] = final_extra_iter_result["loss"]
-    wandb_run.summary["final_extra_iter_eval_bpb"] = final_extra_iter_result["bpb"]
-for eval_result in final_iteration_eval_results:
-    summary_prefix = f"final_iteration_eval/{eval_result['label']}"
-    wandb_run.summary[f"{summary_prefix}_loss"] = eval_result["loss"]
-    wandb_run.summary[f"{summary_prefix}_bpb"] = eval_result["bpb"]
-    wandb_run.summary[f"{summary_prefix}_num_iterations"] = eval_result[
-        "num_iterations"
-    ]
 
 _result_out = args.save_result or result_path
 if master_process:
@@ -2566,10 +2446,6 @@ if master_process:
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
     }
-    if final_extra_iter_result is not None:
-        result["final_extra_iter_eval"] = final_extra_iter_result
-    if final_iteration_eval_results:
-        result["final_iteration_evals"] = final_iteration_eval_results
     with open(_result_out, "w") as f:
         json.dump(result, f, indent=2)
     print0(f"Result saved to {_result_out}")
